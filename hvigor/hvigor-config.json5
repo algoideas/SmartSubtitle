@@ -1,0 +1,20 @@
+{
+  "modelVersion": "5.0.0",
+  "dependencies": {},
+  "execution": {
+    "analyze": "normal",
+    "daemon": true,
+    "incremental": true,
+    "parallel": true,
+    "typeScript": true
+  },
+  "logging": {
+    "level": "info"
+  },
+  "debugging": {
+    "stackTrace": false
+  },
+  "nodeOptions": {
+    "maxOldSpaceSize": 8192
+  }
+}
