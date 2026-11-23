@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "SmartSubtitle entry module"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Real-time AI subtitles (zh/en) with on-device CPU/NPU inference"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "SmartSubtitle"
+    },
+    {
+      "name": "MICROPHONE_REASON",
+      "value": "Capture microphone audio for real-time subtitle recognition"
+    },
+    {
+      "name": "INTERNET_REASON",
+      "value": "Download models and check for updates"
+    }
+  ]
+}

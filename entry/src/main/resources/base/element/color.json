@@ -1,0 +1,16 @@
+{
+  "color": [
+    {
+      "name": "start_window_background",
+      "value": "#0A0A14"
+    },
+    {
+      "name": "subtitle_text_color",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "subtitle_bg_color",
+      "value": "#CC101018"
+    }
+  ]
+}

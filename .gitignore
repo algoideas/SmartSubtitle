@@ -1,0 +1,93 @@
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+# debug information files
+*.dwo
+
+# third_party build artifacts
+third_party/**/build-ohos/
+third_party/**/*.tar.gz
+third_party/**/*.tar.bz2
+third_party/onnxruntime/build-ohos/
+third_party/sherpa-onnx/build-ohos/
+third_party/sherpa-onnx/install/
+third_party/ort-build*.log
+third_party/sherpa-build*.log
+third_party/onnxruntime/stage/
+third_party/eigen-3.4/
+third_party/onnx-rel-1.14.1/
+third_party/ort-eigen-src/
+
+# ===== 项目专用过滤(构建产物与大文件) =====
+# HAP 构建产物与日志
+SmartSubtitle.hap
+dist/
+*.log
+.hvigor/
+entry/.cxx/
+entry/build/
+core/build-cli/
+oh_modules/
+entry/oh-package-lock.json5
+
+# 超过 100M 的原始模型文件(按需从模型发布页下载)
+third_party/models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/encoder.onnx
+third_party/models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/encoder.int8.onnx
+third_party/models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/decoder.onnx
+
+# 超过 GitHub 50M 建议上限的文件(见 README 下载说明)
+third_party/models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/decoder.int8.onnx
+third_party/_deps-download/tensorboard.zip
+
+# HAP 内预置的模型副本(由 build-hap.sh 从 third_party/models 复制)
+entry/src/main/resources/rawfile/models/

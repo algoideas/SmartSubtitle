@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "SmartSubtitle 入口模块"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "端侧 CPU/NPU 实时中英文字幕"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "实时AI字幕"
+    },
+    {
+      "name": "MICROPHONE_REASON",
+      "value": "采集麦克风音频用于实时字幕识别"
+    },
+    {
+      "name": "INTERNET_REASON",
+      "value": "下载模型与检查更新"
+    }
+  ]
+}
