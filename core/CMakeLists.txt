@@ -24,6 +24,8 @@ set(CORE_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 #   $SHERPA_ONNX_ROOT/include/sherpa-onnx/c-api/c-api.h
 #   $SHERPA_ONNX_ROOT/lib/libsherpa-onnx-c-api.so (+ onnxruntime, etc.)
 set(SHERPA_ONNX_ROOT "$ENV{SHERPA_ONNX_ROOT}" CACHE PATH "sherpa-onnx install prefix")
+# 规范化为绝对路径, 避免缓存中的相对路径随构建目录漂移
+get_filename_component(SHERPA_ONNX_ROOT "${SHERPA_ONNX_ROOT}" ABSOLUTE)
 if(EXISTS ${SHERPA_ONNX_ROOT}/include/sherpa-onnx/c-api/c-api.h)
     set(SHERPA_ONNX_FOUND ON)
     include_directories(${SHERPA_ONNX_ROOT}/include)
@@ -72,6 +74,19 @@ target_include_directories(subtitle_core
 target_compile_options(subtitle_core PRIVATE -fPIC -O2)
 
 if(SHERPA_ONNX_FOUND)
+    # NPU 后端复用 sherpa C++ 类(OnlineStream/OnlineParaformerModel)与
+    # ORT C++ API; 头文件来自仓库内 vendored 源码与构建依赖
+    get_filename_component(SHERPA_REPO_ROOT "${SHERPA_ONNX_ROOT}/../.." ABSOLUTE)
+    # 注意: 不要把 sherpa-onnx/csrc 目录加入 include path —
+    # 其中的 features.h 会抢占 libc++ __config 引用的系统 <features.h>
+    target_include_directories(subtitle_core PRIVATE
+        "${SHERPA_REPO_ROOT}"                         # sherpa-onnx/csrc/* 内部引用
+        "${CORE_ROOT}/../third_party/onnxruntime/include/onnxruntime/core/session"
+        "${SHERPA_REPO_ROOT}/build-ohos/_deps/kaldi_decoder-src"        # kaldi-decoder/csrc/*
+        "${SHERPA_REPO_ROOT}/build-ohos/_deps/kaldi_native_fbank-src"   # kaldi-native-fbank/*
+        "${SHERPA_REPO_ROOT}/build-ohos/_deps/kaldifst-src"
+        "${SHERPA_REPO_ROOT}/build-ohos/_deps/openfst-src/src/include"
+    )
     # c-api.a 引用 sherpa_onnx:: 核心符号, 需要整组库; make install 会把
     # sherpa-onnx 组件库与 onnxruntime 组件库+依赖库(nsync/protobuf/onnx/
     # abseil 等)全部装到 install/lib, 此处 glob 全量链接, 并用

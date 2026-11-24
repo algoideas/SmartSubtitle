@@ -189,20 +189,60 @@ pip install packages/rknn_toolkit2-2.1.0+*-cp310-cp310-linux_x86_64.whl
 
 ### 2. 模型转换（ONNX → RKNN）
 
-仓库内置转换脚本 `third_party/rknn/convert_paraformer_encoder.py`，支持 float 与可选 int8 量化：
+仓库内置转换脚本 `third_party/rknn/convert_paraformer_encoder.py`，支持 float 与 int8 量化：
 
 ```bash
 pip3 install rknn-toolkit2==v2.1.0
 python3 third_party/rknn/convert_paraformer_encoder.py \
-    --onnx paraformer-encoder-fp32.onnx --output paraformer-encoder.rknn
+    --onnx third_party/models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/encoder.onnx \
+    --output paraformer-encoder.rknn --frames 18 --feat-dim 560
 ```
 
-RK3588 NPU 对动态 shape 与部分算子（如部分 Attention 变体）支持有限，转换策略为：
+RK3588 NPU 对动态 shape 支持有限，转换脚本做三步预处理：
 
-1. **编码器**：把流式 Paraformer 的 encoder 固定窗口长度（480 ms / 7680 采样）后导出为静态 shape ONNX，再转 `.rknn`；
-2. **解码器 / CTC**：保留在 CPU 上以贪心 CTC 解码（见 `core/src/backends/npu_backend.cc`），避免在 NPU 上实现动态长度解码。
+1. **固定 shape**：流式编码器的动态 batch/长度固定为 `[1, 18, 560]`
+   （18 帧 = 左右文缓存 8 帧 + 当前 10 帧，对应 600 ms 音频；特征 560 = 80 维
+   fbank × 7 帧 LFR 堆叠）；
+2. **speech_lengths 常量化**：把 `speech_lengths` 固化为 INT32 初始化器
+   （值 = 帧数）并从图输入移除，使 `make_pad_mask` 的动态 `Range` 可被
+   常量折叠（否则转换报 "Range need to be constant"）；
+3. **onnxsim 常量折叠**：生成 `*.sim.onnx` 静态图后再转换。
 
-### 3. RK3588 板端部署（OpenHarmony）
+> 主机 onnxruntime 需 ≥ 1.16 才能加载 opset 18 的 Cast(19) 节点。
+
+#### int8 量化（推荐）
+
+NPU 以 fp16 原生精度运行 float 模型，Paraformer 编码器的注意力在 fp16 下
+会溢出（输出 inf）。实测需使用 int8 量化模型：
+
+```bash
+# 校准数据 = 板端运行时导出的真实特征 (每块 18×560 float32)
+python3 third_party/rknn/convert_paraformer_encoder.py \
+    --onnx ... --output paraformer-encoder-int8.rknn \
+    --frames 18 --feat-dim 560 --dataset calib_data/calib.txt
+```
+
+校准数据生成方法：把 CLI 部署到板卡后，设置 `SSUB_NPU_DUMP_CALIB=1`
+运行一次 `--wav` 识别，会自动把真实特征导出到 `/data/local/tmp/npu/calib/`
+（最多 32 块），拉回主机后转成 `.npy` 并列成 `calib.txt` 即可。
+
+### 3. NPU 推理管线（core/src/backends/npu_backend.cc）
+
+NPU 后端与 sherpa-onnx 的流式 Paraformer 识别管线逐层对齐：
+
+```
+16k int16 PCM → fbank(80) → LFR 7 帧堆叠(560) → CMVN(模型元数据) →
+位置编码 → 左右文缓存(5+3 帧) → [1,18,560] → RKNN 编码器(NPU) →
+enc [1,18,512] + alphas → CIF 静音阈值搜索 → 声学嵌入 →
+解码器 CTC(ONNX, CPU) → token id → 文本
+```
+
+- 编码器跑在 NPU（int8 量化 `.rknn`），解码器 CTC 在 CPU（ORT +
+  `decoder.int8.onnx`），CMVN/LFR/位置编码参数均从编码器模型元数据读取；
+- 解码器的长度输入为 **int32**（`enc_len`/`acoustic_embeds_len`），
+  状态缓存 `in_cache_0..15` 形状 `[1,512,10]`，逐块传递。
+
+### 4. RK3588 板端部署（OpenHarmony）
 
 RKNN 运行时已内置在仓库 `third_party/rknn/`（头文件取自 OpenHarmony 样例
 `applications_ai_model_samples/RknnFacialRecognitionDemo_api12`，`librknnrt.so`

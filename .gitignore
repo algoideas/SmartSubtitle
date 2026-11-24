@@ -91,3 +91,8 @@ third_party/_deps-download/tensorboard.zip
 
 # HAP 内预置的模型副本(由 build-hap.sh 从 third_party/models 复制)
 entry/src/main/resources/rawfile/models/
+
+# NPU 转换产物与量化校准数据(体积大, 由转换脚本/板端运行本地生成)
+paraformer-encoder*.rknn
+*.sim.onnx
+calib_data/
