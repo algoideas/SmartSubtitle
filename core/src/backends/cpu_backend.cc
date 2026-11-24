@@ -214,17 +214,31 @@ private:
                 floats[i] = chunk[i] / 32768.0f;
             }
 
-            if (hasVad_ && !SherpaOnnxVoiceActivityDetectorDetected(vad_)) {
-                // Feed VAD so its state advances, but skip the recognizer.
-                SherpaOnnxVoiceActivityDetectorAcceptWaveform(
-                    vad_, floats.data(), floats.size());
-                return;
+            if (getenv("SSUB_CPU_DEBUG")) {
+                static int dbg_cnt = 0;
+                if (dbg_cnt++ % 10 == 0) {
+                    fprintf(stderr,
+                            "cpu: chunk=%d hasVad=%d detected=%d\n",
+                            dbg_cnt, hasVad_,
+                            hasVad_
+                                ? SherpaOnnxVoiceActivityDetectorDetected(vad_)
+                                : -1);
+                }
             }
 
+            // 识别器持续运行, 断句交给端点检测(IsEndpoint)处理。
+            // 注: 不以 VAD Detected() 做门控 — 其语义为"已完成的语音段是否
+            // 待弹出", 持续语音期间不会置位, 且内部缓冲不弹出会在 5 秒后
+            // 冻结, 曾导致 CPU 后端无输出。
             SherpaOnnxOnlineStreamAcceptWaveform(
                 stream_, kSampleRate, floats.data(), floats.size());
 
             while (SherpaOnnxOnlineStreamIsEndpoint(recognizer_, stream_)) {
+                // 音频尾部不足一个分块时帧数不够, 等下一块再触发,
+                // 否则 GetFrames 会因帧数越界抛异常
+                if (!SherpaOnnxIsOnlineStreamReady(recognizer_, stream_)) {
+                    break;
+                }
                 SherpaOnnxDecodeOnlineStream(recognizer_, stream_);
                 const SherpaOnnxOnlineRecognizerResult* r =
                     SherpaOnnxGetOnlineStreamResult(recognizer_, stream_);
