@@ -35,15 +35,25 @@ else()
 endif()
 
 # ===== RKNN runtime (NPU backend, RK3588) =====
-# Point RKNPU_ROOT at the rknpu2 runtime for the target (see README):
+# 默认使用仓库内 third_party/rknn (头文件来自 RknnFacialRecognitionDemo,
+# librknnrt.so 取自 rknn-toolkit2 v2.1.0), 也可用环境变量 RKNPU_ROOT
+# 指向 rknpu2 运行时:
 #   $RKNPU_ROOT/include/rknn_api.h
-#   $RKNPU_ROOT/lib/librknnrt.so
-set(RKNPU_ROOT "$ENV{RKNPU_ROOT}" CACHE PATH "rknpu2 runtime prefix")
+#   $RKNPU_ROOT/lib/librknnrt.so 或 $RKNPU_ROOT/lib/arm64-v8a/librknnrt.so
+if(NOT RKNPU_ROOT)
+    set(RKNPU_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rknn")
+endif()
+set(RKNPU_ROOT "${RKNPU_ROOT}" CACHE PATH "rknpu2 runtime prefix")
 if(EXISTS ${RKNPU_ROOT}/include/rknn_api.h)
     set(RKNN_FOUND ON)
     include_directories(${RKNPU_ROOT}/include)
-    link_directories(${RKNPU_ROOT}/lib)
     add_compile_definitions(SSUB_HAS_RKNN=1)
+    # 库文件兼容两种布局: lib/ 与 lib/arm64-v8a/
+    if(EXISTS ${RKNPU_ROOT}/lib/arm64-v8a/librknnrt.so)
+        link_directories(${RKNPU_ROOT}/lib/arm64-v8a)
+    else()
+        link_directories(${RKNPU_ROOT}/lib)
+    endif()
     message(STATUS "rknpu2: ${RKNPU_ROOT}")
 else()
     message(WARNING "rknpu2 not found at ${RKNPU_ROOT}; NPU backend will be a stub")
