@@ -47,17 +47,15 @@ void PrintTensorAttr(const rknn_tensor_attr& attr, const char* kind)
 
 int main(int argc, char** argv)
 {
-    if (argc < 2) {
-        printf("usage: %s <model.rknn>\n", argv[0]);
-        return 1;
-    }
+    // 未指定模型时使用 hardware_npu2 示例的 RK3588 mobilenet 模型
+    const char* modelPath = (argc >= 2) ? argv[1] : "model/RK3588/mobilenet_v1.rknn";
 
-    std::vector<char> model = ReadFile(argv[1]);
+    std::vector<char> model = ReadFile(modelPath);
     if (model.empty()) {
-        printf("ERROR: cannot read model file: %s\n", argv[1]);
+        printf("ERROR: cannot read model file: %s\n", modelPath);
         return 1;
     }
-    printf("model loaded: %s (%zu bytes)\n", argv[1], model.size());
+    printf("model loaded: %s (%zu bytes)\n", modelPath, model.size());
 
     rknn_context ctx = 0;
     int ret = rknn_init(&ctx, model.data(), model.size(), 0, nullptr);
@@ -93,14 +91,21 @@ int main(int argc, char** argv)
     }
     PrintTensorAttr(out_attr, "output");
 
-    // 构造输入并推理
+    // 构造输入并推理: 按模型输入属性计算 float32 缓冲大小
+    uint32_t elems = 1;
+    for (int i = 0; i < RKNN_MAX_DIMS; i++) {
+        if (in_attr.dims[i] > 0) {
+            elems *= in_attr.dims[i];
+        }
+    }
+    std::vector<float> dummy(elems, 0.0f);
+
     rknn_input in;
     memset(&in, 0, sizeof(in));
     in.index = 0;
     in.type = RKNN_TENSOR_FLOAT32;
     in.fmt = in_attr.fmt;
-    in.size = in_attr.size;
-    std::vector<float> dummy(in_attr.size / sizeof(float), 0.0f);
+    in.size = elems * sizeof(float);
     in.buf = dummy.data();
     in.pass_through = 0;
     ret = rknn_inputs_set(ctx, 1, &in);
