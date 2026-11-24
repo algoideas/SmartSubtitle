@@ -1,0 +1,7 @@
+/home/data/minjie.yu/openharmony/third_party/codebuddy/SmartSubtitle/third_party/rknn/application/rknn_model_demo/build/CMakeFiles/rknn_model_demo.dir
+/home/data/minjie.yu/openharmony/third_party/codebuddy/SmartSubtitle/third_party/rknn/application/rknn_model_demo/build/CMakeFiles/edit_cache.dir
+/home/data/minjie.yu/openharmony/third_party/codebuddy/SmartSubtitle/third_party/rknn/application/rknn_model_demo/build/CMakeFiles/rebuild_cache.dir
+/home/data/minjie.yu/openharmony/third_party/codebuddy/SmartSubtitle/third_party/rknn/application/rknn_model_demo/build/CMakeFiles/list_install_components.dir
+/home/data/minjie.yu/openharmony/third_party/codebuddy/SmartSubtitle/third_party/rknn/application/rknn_model_demo/build/CMakeFiles/install.dir
+/home/data/minjie.yu/openharmony/third_party/codebuddy/SmartSubtitle/third_party/rknn/application/rknn_model_demo/build/CMakeFiles/install/local.dir
+/home/data/minjie.yu/openharmony/third_party/codebuddy/SmartSubtitle/third_party/rknn/application/rknn_model_demo/build/CMakeFiles/install/strip.dir
