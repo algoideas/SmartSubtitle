@@ -11,9 +11,16 @@
 
 #if __has_include("rknn_api.h")
 
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <fstream>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include <rknn_api.h>
 
@@ -48,7 +55,7 @@ public:
         }
         // Bind to NPU core 0 (RK3588 has three cores; one core is enough for
         // a streaming encoder at this size and keeps the others free).
-        rknn_set_core_mask(&ctx_, RKNN_NPU_CORE_0);
+        rknn_set_core_mask(ctx_, RKNN_NPU_CORE_0);
 
         if (!LoadTokens(config.modelDir + "/tokens.txt")) {
             lastError_ = "failed to load tokens.txt from " + config.modelDir;
@@ -60,8 +67,8 @@ public:
         std::string vadModel = config.modelDir + "/silero_vad.onnx";
         vadCfg.silero_vad.model = vadModel.c_str();
         vadCfg.silero_vad.threshold = 0.5f;
+        vadCfg.silero_vad.window_size = 512;
         vadCfg.sample_rate = kSampleRate;
-        vadCfg.sample_rate_str = std::to_string(kSampleRate).c_str();
         vad_ = SherpaOnnxCreateVoiceActivityDetector(&vadCfg, 5.0f);
 #endif
 
@@ -78,8 +85,13 @@ public:
         }
 #ifdef SSUB_HAS_SHERPA_VAD
         if (vad_ != nullptr) {
+            // VAD C API 需要 float 采样
+            vadFloat_.resize(samples);
+            for (size_t i = 0; i < samples; i++) {
+                vadFloat_[i] = pcm[i] / 32768.0f;
+            }
             SherpaOnnxVoiceActivityDetectorAcceptWaveform(
-                vad_, pcm, samples, kSampleRate);
+                vad_, vadFloat_.data(), samples);
         }
 #endif
     }
@@ -104,12 +116,16 @@ public:
         }
         if (vad_ != nullptr) {
             SherpaOnnxDestroyVoiceActivityDetector(vad_);
+            vad_ = nullptr;
         }
-        rknn_destroy(&ctx_);
+        if (ctx_) {
+            rknn_destroy(ctx_);
+            ctx_ = 0;
+        }
     }
 
 private:
-    rknn_status LoadModel(const std::string& path)
+    int LoadModel(const std::string& path)
     {
         std::vector<char> model = ReadFile(path);
         if (model.empty()) {
@@ -145,11 +161,11 @@ private:
         in.size = n * sizeof(int16_t);
         in.buf = const_cast<int16_t*>(window);
         in.pass_through = 0;
-        if (rknn_inputs_set(&ctx_, 1, &in) != RKNN_SUCC) {
+        if (rknn_inputs_set(ctx_, 1, &in) != RKNN_SUCC) {
             lastError_ = "rknn_inputs_set failed";
             return;
         }
-        if (rknn_run(&ctx_, nullptr) != RKNN_SUCC) {
+        if (rknn_run(ctx_, nullptr) != RKNN_SUCC) {
             lastError_ = "rknn_run failed";
             return;
         }
@@ -158,7 +174,7 @@ private:
         out.index = 0;
         out.want_float = 1;
         out.is_prealloc = 0;
-        if (rknn_outputs_get(&ctx_, 1, &out, nullptr) != RKNN_SUCC) {
+        if (rknn_outputs_get(ctx_, 1, &out, nullptr) != RKNN_SUCC) {
             lastError_ = "rknn_outputs_get failed";
             return;
         }
@@ -184,7 +200,7 @@ private:
             }
             prev = best;
         }
-        rknn_outputs_release(&ctx_, 1, &out);
+        rknn_outputs_release(ctx_, 1, &out);
 
         if (!text.empty()) {
             AsrResult res;
@@ -205,7 +221,7 @@ private:
                 } else {
 #ifdef SSUB_HAS_SHERPA_VAD
                     if (vad_ != nullptr &&
-                        !SherpaOnnxVoiceActivityDetectorContainsSpeech(vad_)) {
+                        !SherpaOnnxVoiceActivityDetectorDetected(vad_)) {
                         pending_.clear();  // idle: drop silence, keep NPU cool
                         continue;
                     }
@@ -229,6 +245,7 @@ private:
     AsrCallback callback_{};
     std::mutex mu_;
     std::vector<int16_t> pending_;
+    std::vector<float> vadFloat_;
     std::string context_;   // committed text for the current utterance
     std::string lastError_ = "ok";
     std::thread worker_;
@@ -243,6 +260,7 @@ std::unique_ptr<AsrBackend> CreateNpuBackend()
 {
     return std::make_unique<NpuBackend>();
 }
+}  // namespace subtitle
 
 #else  // RKNN not available
 

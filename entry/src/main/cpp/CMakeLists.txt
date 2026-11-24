@@ -66,4 +66,10 @@ if(EXISTS ${RKNPU_DIR}/libs/arm64-v8a/librknnrt.so)
     target_link_libraries(entry PUBLIC
         ${RKNPU_DIR}/libs/arm64-v8a/librknnrt.so
     )
+elseif(EXISTS ${NATIVERENDER_ROOT_PATH}/third_party/rknn/libs/arm64-v8a/librknnrt.so)
+    # 回退: 仓库内 third_party/rknn (librknnrt.so 取自 rknn-toolkit2 v2.1.0)
+    target_compile_definitions(entry PRIVATE SSUB_HAS_RKNN=1)
+    target_link_libraries(entry PUBLIC
+        ${NATIVERENDER_ROOT_PATH}/third_party/rknn/libs/arm64-v8a/librknnrt.so
+    )
 endif()

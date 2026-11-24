@@ -189,50 +189,43 @@ pip install packages/rknn_toolkit2-2.1.0+*-cp310-cp310-linux_x86_64.whl
 
 ### 2. 模型转换（ONNX → RKNN）
 
+仓库内置转换脚本 `third_party/rknn/convert_paraformer_encoder.py`，支持 float 与可选 int8 量化：
+
+```bash
+pip3 install rknn-toolkit2==v2.1.0
+python3 third_party/rknn/convert_paraformer_encoder.py \
+    --onnx paraformer-encoder-fp32.onnx --output paraformer-encoder.rknn
+```
+
 RK3588 NPU 对动态 shape 与部分算子（如部分 Attention 变体）支持有限，转换策略为：
 
 1. **编码器**：把流式 Paraformer 的 encoder 固定窗口长度（480 ms / 7680 采样）后导出为静态 shape ONNX，再转 `.rknn`；
 2. **解码器 / CTC**：保留在 CPU 上以贪心 CTC 解码（见 `core/src/backends/npu_backend.cc`），避免在 NPU 上实现动态长度解码。
 
-```python
-# convert_paraformer.py —— 在 x86 主机执行
-import onnx
-from rknn.api import RKNN
-
-ONNX_MODEL = 'paraformer-encoder-fp32.onnx'   # 固定窗口(7680采样)的编码器导出
-OUT        = 'paraformer-encoder.rknn'
-
-rknn = RKNN(verbose=True)
-rknn.config(
-    mean_values=[[0]], std_values=[[1]],        # 前端已归一化，此处恒等
-    quantized_dtype='w8a16',                    # RK3588 支持 int16 激活，保精度
-    target_platform='rk3588',
-    optimization_level=3,
-)
-ret = rknn.load_onnx(model=ONNX_MODEL)
-assert ret == 0, 'load_onnx failed'
-ret = rknn.build(do_quantization=False)         # 流式识别对精度敏感，先不做量化
-assert ret == 0, 'build failed'
-ret = rknn.export_rknn(OUT)
-assert ret == 0, 'export_rknn failed'
-rknn.release()
-```
-
-```bash
-python3 convert_paraformer.py
-# 产物：paraformer-encoder.rknn
-```
-
 ### 3. RK3588 板端部署（OpenHarmony）
 
+RKNN 运行时已内置在仓库 `third_party/rknn/`（头文件取自 OpenHarmony 样例
+`applications_ai_model_samples/RknnFacialRecognitionDemo_api12`，`librknnrt.so`
+取自 rknn-toolkit2 v2.1.0），构建时自动链接并打包进 HAP：
+
 ```bash
-# NPU 运行时（rknpu2 runtime 中取出 aarch64 版本）
-hdc shell mkdir -p /data/local/tmp/smartsubtitle/models /system/lib64
-hdc file send rknn-toolkit2/rknn-toolkit2/runtime/Linux/librknn_api/arm64/librknnrt.so /system/lib64/
+third_party/rknn/include/           # rknn_api.h 等
+third_party/rknn/lib/arm64-v8a/librknnrt.so
+entry/src/main/cpp/third_party/rknn/   # 构建时 entry 侧使用的副本
+entry/libs/arm64-v8a/librknnrt.so      # 打包进 HAP 的运行时库
+```
+
+模型文件部署到 RK3588 板端（OpenHarmony）：
+
+```bash
+hdc shell mkdir -p /data/local/tmp/smartsubtitle/models
 hdc file send paraformer-encoder.rknn /data/local/tmp/smartsubtitle/models/
 # Silero VAD 与 tokens.txt 与 CPU 后端共用
 hdc file send ~/smartsubtitle-work/silero_vad.onnx /data/local/tmp/smartsubtitle/models/
 ```
+
+> 注：`librknnrt.so` 由 NPU 后端在运行时自动加载；CPU 后端不依赖它，
+> 在非 RK3588 设备上同样可以正常安装运行。
 
 工程内运行时头文件与库的目录约定：
 
