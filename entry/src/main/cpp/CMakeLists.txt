@@ -22,10 +22,8 @@ if(NOT EXISTS ${RKNPU_DIR}/include)
     # 回退: 仓库根 third_party/rknn (librknnrt.so 取自 rknn-toolkit2 v2.1.0)
     set(RKNPU_DIR ${NATIVERENDER_ROOT_PATH}/third_party/rknn)
 endif()
-
-# 双编码器管线的 npu_backend.cc 引用 sherpa csrc 头文件与
-# onnxruntime C++ 头文件, 来自仓库内 sherpa-onnx 源码树与
-# build-ohos 的依赖子树 (kaldi-decoder/kaldi-native-fbank/openfst/eigen)
+# 双后端管线的 npu_backend.cc 引用 sherpa csrc 头文件与 onnxruntime
+# C++ 头文件, 来自仓库内 sherpa-onnx 源码树与 build-ohos 依赖子树
 set(SHERPA_SOURCE_ROOT ${NATIVERENDER_ROOT_PATH}/../../../../third_party/sherpa-onnx)
 set(SHERPA_DEPS ${SHERPA_SOURCE_ROOT}/build-ohos/_deps)
 
@@ -46,6 +44,7 @@ include_directories(
 
 add_library(entry SHARED
     napi_init.cpp
+    ${CORE_ROOT}/src/backends/rknn_runtime.cc
     ${CORE_ROOT}/src/backends/asr_backend.cpp
     ${CORE_ROOT}/src/backends/cpu_backend.cc
     ${CORE_ROOT}/src/backends/npu_backend.cc
@@ -80,15 +79,8 @@ if(EXISTS ${SHERPA_ONNX_DIR}/libs/arm64-v8a/libsherpa-onnx-c-api.a)
     target_link_libraries(entry PUBLIC -Wl,--no-as-needed -lc++)
 endif()
 
-if(EXISTS ${RKNPU_DIR}/libs/arm64-v8a/librknnrt.so)
+# librknnrt.so 改为运行时 dlopen(rknn_runtime.cc), 避免链接期依赖
+# 导致 Worker 线程 dlopen(libentry.so) 崩溃; 头文件仍需 SSUB_HAS_RKNN
+if(EXISTS ${RKNPU_DIR}/include/rknn_api.h)
     target_compile_definitions(entry PRIVATE SSUB_HAS_RKNN=1)
-    target_link_libraries(entry PUBLIC
-        ${RKNPU_DIR}/libs/arm64-v8a/librknnrt.so
-    )
-elseif(EXISTS ${NATIVERENDER_ROOT_PATH}/third_party/rknn/libs/arm64-v8a/librknnrt.so)
-    # 回退: 仓库内 third_party/rknn (librknnrt.so 取自 rknn-toolkit2 v2.1.0)
-    target_compile_definitions(entry PRIVATE SSUB_HAS_RKNN=1)
-    target_link_libraries(entry PUBLIC
-        ${NATIVERENDER_ROOT_PATH}/third_party/rknn/libs/arm64-v8a/librknnrt.so
-    )
 endif()

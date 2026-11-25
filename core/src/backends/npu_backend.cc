@@ -27,7 +27,6 @@
 #include "sherpa-onnx/csrc/online-stream.h"
 
 #include "asr_backend.h"
-#include "manual_fbank.h"
 
 namespace subtitle {
 
@@ -55,8 +54,6 @@ void Scale(const float *x, int32_t n, float scale, float *y) {
 
 class NpuBackend : public AsrBackend {
  public:
-  explicit NpuBackend(bool use_ort) : use_ort_(use_ort) {}
-
   bool Init(const BackendConfig& config, AsrCallback callback) override {
     callback_ = std::move(callback);
 
@@ -93,54 +90,57 @@ class NpuBackend : public AsrBackend {
       }
     }
 
-    // 2) 特征提取: 使用 ManualFbank (与主机已验证可正确解码的参考
-    // 管线 tools/host_ref.py 数学一致), 替代 knf OnlineStream
-    mf_ = std::make_unique<ManualFbank>();
+    // 2) 特征提取配置: paraformer 要求样本保持原始 int16 量级;
+    // high_freq 默认 -400 会把梅尔滤波截止到 7600Hz, 与训练配置
+    // (全频带 8000Hz)不符导致识别退化, 显式取 0 (奈奎斯特频率)
+    sherpa_onnx::FeatureExtractorConfig feat_cfg;
+    feat_cfg.feature_dim = 80;
+    feat_cfg.normalize_samples = false;
+    feat_cfg.high_freq = 0.0f;
+    feat_cfg.snip_edges = true;  // 与 kaldi/训练配置一致的分帧方式
+    stream_ = std::make_unique<sherpa_onnx::OnlineStream>(feat_cfg);
 
-    // 3) RKNN 编码器 (ORT 模式下走 CPU 编码器, 跳过 RKNN 初始化)
-    if (!use_ort_) {
-      if (LoadModel(config.modelDir + "/paraformer-encoder.rknn") !=
-          RKNN_SUCC) {
-        lastError_ = "failed to load paraformer-encoder.rknn from " +
-                     config.modelDir;
-        return false;
-      }
-      rknn_set_core_mask(ctx_, RKNN_NPU_CORE_0);
+    // 3) RKNN 编码器
+    if (LoadModel(config.modelDir + "/paraformer-encoder.rknn") != RKNN_SUCC) {
+      lastError_ = "failed to load paraformer-encoder.rknn from " +
+                   config.modelDir;
+      return false;
+    }
+    rknn_set_core_mask(ctx_, RKNN_NPU_CORE_0);
 
-      // 查询输入属性: 记录 fmt/size 供 rknn_inputs_set 使用
-      rknn_tensor_attr in_attr;
-      memset(&in_attr, 0, sizeof(in_attr));
-      in_attr.index = 0;
-      if (rknn_query(ctx_, RKNN_QUERY_INPUT_ATTR, &in_attr,
-                     sizeof(in_attr)) != RKNN_SUCC) {
-        lastError_ = "rknn_query input attr failed";
-        return false;
+    // 查询输入属性: 记录 fmt/size 供 rknn_inputs_set 使用
+    rknn_tensor_attr in_attr;
+    memset(&in_attr, 0, sizeof(in_attr));
+    in_attr.index = 0;
+    if (rknn_query(ctx_, RKNN_QUERY_INPUT_ATTR, &in_attr,
+                   sizeof(in_attr)) != RKNN_SUCC) {
+      lastError_ = "rknn_query input attr failed";
+      return false;
+    }
+    in_fmt_ = in_attr.fmt;
+    in_elems_ = 1;
+    for (int i = 0; i < RKNN_MAX_DIMS; i++) {
+      if (in_attr.dims[i] > 0) {
+        in_elems_ *= in_attr.dims[i];
       }
-      in_fmt_ = in_attr.fmt;
-      in_elems_ = 1;
-      for (int i = 0; i < RKNN_MAX_DIMS; i++) {
-        if (in_attr.dims[i] > 0) {
-          in_elems_ *= in_attr.dims[i];
-        }
-      }
-      if (in_elems_ != 18 * 560) {
-        fprintf(stderr, "npu: unexpected encoder input elems %u (expect %d)\n",
-                in_elems_, 18 * 560);
-      }
+    }
+    if (in_elems_ != 18 * 560) {
+      fprintf(stderr, "npu: unexpected encoder input elems %u (expect %d)\n",
+              in_elems_, 18 * 560);
+    }
 
-      // 输出数量: enc 在 0, alphas 在最后一个 (enc_len 为 int64, 不请求)
-      rknn_input_output_num io_num;
-      memset(&io_num, 0, sizeof(io_num));
-      if (rknn_query(ctx_, RKNN_QUERY_IN_OUT_NUM, &io_num,
-                     sizeof(io_num)) != RKNN_SUCC) {
-        lastError_ = "rknn_query output num failed";
-        return false;
-      }
-      alpha_index_ = io_num.n_output - 1;
-      if (getenv("SSUB_NPU_DEBUG")) {
-        fprintf(stderr, "npu: encoder outputs=%u alpha_index=%u\n",
-                io_num.n_output, alpha_index_);
-      }
+    // 输出数量: enc 在 0, alphas 在最后一个 (enc_len 为 int64, 不请求)
+    rknn_input_output_num io_num;
+    memset(&io_num, 0, sizeof(io_num));
+    if (rknn_query(ctx_, RKNN_QUERY_IN_OUT_NUM, &io_num,
+                   sizeof(io_num)) != RKNN_SUCC) {
+      lastError_ = "rknn_query output num failed";
+      return false;
+    }
+    alpha_index_ = io_num.n_output - 1;
+    if (getenv("SSUB_NPU_DEBUG")) {
+      fprintf(stderr, "npu: encoder outputs=%u alpha_index=%u\n",
+              io_num.n_output, alpha_index_);
     }
 
     feat_dim_ = static_cast<int32_t>(model_->NegativeMean().size());
@@ -152,13 +152,19 @@ class NpuBackend : public AsrBackend {
 
   void Feed(const int16_t* pcm, size_t samples) override {
     std::vector<float> floats(samples);
+    // normalize_samples=false 时 FeatureExtractor 内部会把输入乘回
+    // 32768, 因此这里喂归一化 [-1,1] 采样
+    for (size_t i = 0; i < samples; i++) {
+      floats[i] = pcm[i] / 32768.0f;
+    }
     std::lock_guard<std::mutex> lk(stream_mu_);
-    mf_->Feed(pcm, samples);
+    stream_->AcceptWaveform(kSampleRate, floats.data(),
+                            static_cast<int32_t>(floats.size()));
   }
 
   void Reset() override {
     std::lock_guard<std::mutex> lk(stream_mu_);
-    mf_ = std::make_unique<ManualFbank>();
+    stream_->Reset();
     num_processed_ = 0;
     feat_cache_.clear();
     initial_hidden_.clear();
@@ -224,8 +230,6 @@ class NpuBackend : public AsrBackend {
     float* p = v->data();
     for (int32_t i = 0; i != num_frames; ++i) {
       for (int32_t k = 0; k != dim; ++k) {
-        // 恢复上游公式 (v + neg_mean): 实测两种符号下编码器行为
-        // 均异常, 上游公式特征量级合理且为经过上游验证的路径
         p[k] = (p[k] + neg_mean[k]) * inv_stddev[k];
       }
       p += dim;
@@ -255,10 +259,7 @@ class NpuBackend : public AsrBackend {
     int32_t processed_before;
     {
       std::lock_guard<std::mutex> lk(stream_mu_);
-      frames = mf_->GetFrames(num_processed_, kChunkFrames);
-      if (frames.empty()) {
-        return;  // 样本不足一整块, 等待更多音频
-      }
+      frames = stream_->GetFrames(num_processed_, kChunkFrames);
       processed_before = num_processed_;
       num_processed_ += kChunkFrames - 1;
     }
@@ -295,20 +296,9 @@ class NpuBackend : public AsrBackend {
                 pre_cmvn_mean0, pre_cmvn_std0,
                 -model_->NegativeMean()[0], model_->InverseStdDev()[0]);
     }
-    // 左右文缓存: 首块补零, 之后与上一块尾部重叠
-    if (feat_cache_.empty()) {
-      feat_cache_.resize((kLeftChunkFrames + kRightChunkFrames) * feat_dim_, 0);
-    }
-    // 与主机参考管线(tools/host_ref.py)完全一致的处理顺序:
-    // 拼缓存 -> 整窗 CMVN -> 整窗 PE -> 缓存更新。
-    // (只对当前帧归一化再拼缓存的旧实现会使编码器输出恒为
-    // "末帧 alpha=1.0"的边界态, 无 token 输出)
-    frames.insert(frames.begin(), feat_cache_.begin(), feat_cache_.end());
     ApplyCMVN(&frames);
     // PE 偏移使用递增前的帧数 (与 sherpa 一致)
     PositionalEncoding(&frames, processed_before / model_->LfrWindowShift());
-    std::copy(frames.end() - feat_cache_.size(), frames.end(),
-              feat_cache_.begin());
     if (getenv("SSUB_NPU_DEBUG")) {
       float s = 0;
       for (float f : frames) {
@@ -326,9 +316,31 @@ class NpuBackend : public AsrBackend {
               frames.size(), static_cast<int>(std::isnan(s)), sum);
     }
 
+    // 左右文缓存: 首块补零, 之后与上一块尾部重叠
+    if (feat_cache_.empty()) {
+      feat_cache_.resize((kLeftChunkFrames + kRightChunkFrames) * feat_dim_, 0);
+    }
+    frames.insert(frames.begin(), feat_cache_.begin(), feat_cache_.end());
+    std::copy(frames.end() - feat_cache_.size(), frames.end(),
+              feat_cache_.begin());
+
     int32_t num_frames = static_cast<int32_t>(frames.size()) / feat_dim_;
 
+    // RKNN 编码器推理
+    rknn_input in;
+    memset(&in, 0, sizeof(in));
+    in.index = 0;
+    in.type = RKNN_TENSOR_FLOAT32;
+    in.fmt = in_fmt_;
+    in.size = frames.size() * sizeof(float);
+    in.buf = frames.data();
+    in.pass_through = 0;
+    if (rknn_inputs_set(ctx_, 1, &in) != RKNN_SUCC) {
+      lastError_ = "rknn_inputs_set failed";
+      return;
+    }
     if (getenv("SSUB_NPU_DUMP_CALIB")) {
+      // 导出真实特征作为 int8 量化校准数据 (最多 32 块)
       static int calib_idx = 0;
       if (calib_idx < 32) {
         char p[160];
@@ -341,89 +353,40 @@ class NpuBackend : public AsrBackend {
         calib_idx++;
       }
     }
-
-    // 编码器推理: ORT(CPU 模式) 或 RKNN(NPU 模式)
-    std::vector<float> enc_copy;
-    std::vector<float> alpha;
-    if (use_ort_) {
-      // CPU 推理路径: ORT int8 编码器, 与主机参考管线一致
-      auto memory_info2 =
-          Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
-      std::array<int64_t, 3> x_shape{1, num_frames, feat_dim_};
-      Ort::Value x = Ort::Value::CreateTensor(
-          memory_info2, const_cast<float*>(frames.data()), frames.size(),
-          x_shape.data(), 3);
-      int32_t x_len = num_frames;
-      std::array<int64_t, 1> l_shape{1};
-      Ort::Value x_len_v =
-          Ort::Value::CreateTensor(memory_info2, &x_len, 1, l_shape.data(), 1);
-      auto ref = model_->ForwardEncoder(std::move(x), std::move(x_len_v));
-      const float* ref_enc = ref[0].GetTensorData<float>();
-      const float* ref_alpha = ref[2].GetTensorData<float>();
-      enc_copy.assign(ref_enc, ref_enc + num_frames * 512);
-      alpha.assign(ref_alpha, ref_alpha + num_frames);
-    } else {
-      rknn_input in;
-      memset(&in, 0, sizeof(in));
-      in.index = 0;
-      in.type = RKNN_TENSOR_FLOAT32;
-      // 数据按 NCHW 布局 [1,18,560] 传入; 若声明为运行时默认的 NHWC,
-      // 会被错误重排导致特征 scrambled、编码器输出异常
-      in.fmt = RKNN_TENSOR_NCHW;
-      in.size = frames.size() * sizeof(float);
-      in.buf = frames.data();
-      in.pass_through = 0;
-      if (rknn_inputs_set(ctx_, 1, &in) != RKNN_SUCC) {
-        lastError_ = "rknn_inputs_set failed";
-        return;
-      }
-      if (rknn_run(ctx_, nullptr) != RKNN_SUCC) {
-        lastError_ = "rknn_run failed";
-        fprintf(stderr, "npu: rknn_run failed\n");
-        return;
-      }
-
-      // 只请求 enc(0) 与 alphas(最后), 跳过 int64 的 enc_len
-      rknn_output outs[2];
-      memset(outs, 0, sizeof(outs));
-      outs[0].index = 0;
-      outs[0].want_float = 1;
-      outs[0].is_prealloc = 0;
-      outs[1].index = alpha_index_;
-      outs[1].want_float = 1;
-      outs[1].is_prealloc = 0;
-      if (rknn_outputs_get(ctx_, 2, outs, nullptr) != RKNN_SUCC) {
-        lastError_ = "rknn_outputs_get failed";
-        fprintf(stderr, "npu: rknn_outputs_get failed\n");
-        return;
-      }
-
-      const float* p_enc =
-          reinterpret_cast<const float*>(outs[0].buf);  // [1, num_frames, 512]
-      const float* p_alpha =
-          reinterpret_cast<const float*>(outs[1].buf);  // [1, num_frames]
-
-      // 拷贝 enc 数据后立即释放 RKNN 输出缓冲, 避免悬垂引用
-      enc_copy.assign(p_enc, p_enc + num_frames * 512);
-      alpha.assign(p_alpha, p_alpha + num_frames);
-      rknn_outputs_release(ctx_, 2, outs);
+    if (rknn_run(ctx_, nullptr) != RKNN_SUCC) {
+      lastError_ = "rknn_run failed";
+      fprintf(stderr, "npu: rknn_run failed\n");
+      return;
     }
-    const float* p_enc = enc_copy.data();
+
+    // 只请求 enc(0) 与 alphas(最后), 跳过 int64 的 enc_len
+    rknn_output outs[2];
+    memset(outs, 0, sizeof(outs));
+    outs[0].index = 0;
+    outs[0].want_float = 1;
+    outs[0].is_prealloc = 0;
+    outs[1].index = alpha_index_;
+    outs[1].want_float = 1;
+    outs[1].is_prealloc = 0;
+    if (rknn_outputs_get(ctx_, 2, outs, nullptr) != RKNN_SUCC) {
+      lastError_ = "rknn_outputs_get failed";
+      fprintf(stderr, "npu: rknn_outputs_get failed\n");
+      return;
+    }
+
+    const float* p_enc =
+        reinterpret_cast<const float*>(outs[0].buf);  // [1, num_frames, 512]
     int32_t enc_dim = 512;
-    if (getenv("SSUB_NPU_DEBUG")) {
-      float a_sum = 0, a_max = 0;
-      for (float a : alpha) {
-        a_sum += a;
-        a_max = std::max(a_max, a);
-      }
-      fprintf(stderr, "npu: alpha sum=%.3f max=%.3f\n", a_sum, a_max);
-      fprintf(stderr, "npu: alpha vec=[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-              "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]\n",
-              alpha[0], alpha[1], alpha[2], alpha[3], alpha[4], alpha[5],
-              alpha[6], alpha[7], alpha[8], alpha[9], alpha[10], alpha[11],
-              alpha[12], alpha[13], alpha[14], alpha[15], alpha[16],
-              alpha[17]);
-    }
+    const float* p_alpha =
+        reinterpret_cast<const float*>(outs[1].buf);  // [1, num_frames]
+
+    // 拷贝 enc 数据后立即释放 RKNN 输出缓冲, 避免悬垂引用
+    std::vector<float> enc_copy(p_enc, p_enc + num_frames * enc_dim);
+    rknn_outputs_release(ctx_, 2, outs);
+    p_enc = enc_copy.data();
+
+    // CIF: 左右文边界上的 alpha 置零 (与 sherpa 一致)
+    std::vector<float> alpha(p_alpha, p_alpha + num_frames);
     std::fill(alpha.begin(), alpha.begin() + kLeftChunkFrames, 0.0f);
     std::fill(alpha.end() - kRightChunkFrames, alpha.end(), 0.0f);
 
@@ -573,7 +536,7 @@ class NpuBackend : public AsrBackend {
       bool ready = false;
       {
         std::lock_guard<std::mutex> lk(stream_mu_);
-        ready = mf_->AvailableFrames() >=
+        ready = stream_->NumFramesReady() >=
                 num_processed_ + kChunkFrames;
       }
       if (ready) {
@@ -592,7 +555,7 @@ class NpuBackend : public AsrBackend {
   }
 
   std::unique_ptr<sherpa_onnx::OnlineParaformerModel> model_;
-  std::unique_ptr<ManualFbank> mf_;
+  std::unique_ptr<sherpa_onnx::OnlineStream> stream_;
   std::map<int32_t, std::string> tokens_;
 
   rknn_context ctx_ = 0;
@@ -600,7 +563,6 @@ class NpuBackend : public AsrBackend {
   rknn_tensor_format in_fmt_ = RKNN_TENSOR_NHWC;
   uint32_t in_elems_ = 0;
   uint32_t alpha_index_ = 2;  // alphas 输出索引 (最后一个输出)
-  bool use_ort_ = false;      // true: ORT 编码器 (CPU 模式)
 
   int32_t num_processed_ = 0;
   std::vector<float> feat_cache_;
@@ -619,9 +581,9 @@ class NpuBackend : public AsrBackend {
 
 }  // namespace
 
-std::unique_ptr<AsrBackend> CreateNpuBackend(bool use_ort)
+std::unique_ptr<AsrBackend> CreateNpuBackend()
 {
-  return std::make_unique<NpuBackend>(use_ort);
+  return std::make_unique<NpuBackend>();
 }
 }  // namespace subtitle
 
@@ -650,7 +612,7 @@ class NpuStub : public AsrBackend {
   std::string lastError_;
 };
 }
-std::unique_ptr<AsrBackend> CreateNpuBackend(bool)
+std::unique_ptr<AsrBackend> CreateNpuBackend()
 {
   return std::make_unique<NpuStub>();
 }

@@ -29,6 +29,11 @@ struct Index {
   @State buttonPressed: boolean = false;
   @State envChecking: boolean = false;
 
+  // 当前推理后端的显示文本(与 backend 状态联动)
+  private getBackendLabel(): string {
+    return this.backend === 'cpu' ? 'CPU (sherpa-onnx)' : 'NPU (RK3588)';
+  }
+
   private audioCapturer: audio.AudioCapturer | null = null;
   private reading: boolean = false;
   private subtitleWorker: worker.ThreadWorker | null = null;
@@ -275,6 +280,7 @@ struct Index {
             { value: 'CPU (sherpa-onnx)' },
             { value: 'NPU (RK3588)' }
           ])
+            .value(this.backend === 'cpu' ? 'CPU (sherpa-onnx)' : 'NPU (RK3588)')
             .selected(this.backend === 'cpu' ? 0 : 1)
             .enabled(!this.running)
             .onSelect((index: number) => {
@@ -314,6 +320,12 @@ struct Index {
       .backgroundColor('#1A1A2E')
       .borderRadius(16)
       .margin({ bottom: 12 })
+
+      // 当前推理后端显示
+      Text(`当前推理后端: ${this.getBackendLabel()}`)
+        .fontSize(13)
+        .fontColor('#8AB4F8')
+        .margin({ bottom: 8 })
 
       if (this.lastError !== '') {
         Text(this.lastError)
@@ -364,6 +376,20 @@ struct Index {
       .borderRadius(16)
       .align(Alignment.Bottom)
 
+      // 环境检查: 位于开始识别上方, 识别预制 0.wav 验证端到端链路
+      Button(this.envChecking ? '检查中…' : '环境检查')
+        .width('70%')
+        .height(40)
+        .fontSize(14)
+        .fontColor('#E6F2FF')
+        .backgroundColor('#26263A')
+        .borderRadius(20)
+        .margin({ top: 8 })
+        .enabled(!this.running && !this.envChecking)
+        .onClick(() => {
+          this.envCheck();
+        })
+
       Button(this.running ? '停止' : '开始识别')
         .width('70%')
         .height(48)
@@ -371,7 +397,7 @@ struct Index {
         .fontColor('#FFFFFF')
         .backgroundColor(this.running ? '#C8402F' : '#0A59F7')
         .borderRadius(24)
-        .margin({ top: 8 })
+        .margin({ top: 8, bottom: 24 })
         .onTouch((event: TouchEvent) => {
           // 按压反馈: 按下时降低不透明度, 符合 HarmonyOS 交互规范
           if (event.type === TouchType.Down) {
@@ -387,19 +413,6 @@ struct Index {
           } else {
             this.start();
           }
-        })
-
-      Button(this.envChecking ? '检查中…' : '环境检查')
-        .width('70%')
-        .height(40)
-        .fontSize(14)
-        .fontColor('#E6F2FF')
-        .backgroundColor('#26263A')
-        .borderRadius(20)
-        .margin({ top: 8, bottom: 24 })
-        .enabled(!this.running && !this.envChecking)
-        .onClick(() => {
-          this.envCheck();
         })
     }
     .width('100%')

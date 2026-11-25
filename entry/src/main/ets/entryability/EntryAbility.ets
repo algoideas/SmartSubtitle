@@ -1,6 +1,9 @@
 import { UIAbility } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+// 主线程预加载原生模块: 避免 Worker 首次加载 libentry.so 时触发
+// musl dlopen 的符号解析崩溃(含 RKNN 链接后尤为必现)
+import { getLastError } from 'libentry.so';
 
 const TAG = 'SmartSubtitle';
 
