@@ -35,7 +35,10 @@ struct FeatureExtractorConfig {
   // https://github.com/lhotse-speech/lhotse/blob/master/lhotse/features/fbank.py#L27
   // and
   // https://github.com/k2-fsa/sherpa-onnx/issues/514
-  float high_freq = -400.0f;
+  // 本地补丁: 默认 -400 会把梅尔滤波截止到 7600Hz, 与 paraformer
+  // 训练配置(全频带 8000Hz)不符, 实测导致识别严重退化, 改为 0
+  // (奈奎斯特频率)。恢复上游默认时同时检查两个后端的识别质量。
+  float high_freq = 0.0f;
 
   // dithering constant, useful for signals with hard-zeroes in non-speech parts
   // this prevents large negative values in log-mel filterbanks
@@ -52,7 +55,8 @@ struct FeatureExtractorConfig {
   // If false, we will multiply the inputs by 32768
   bool normalize_samples = true;
 
-  bool snip_edges = false;
+  // 本地补丁: 与 paraformer 训练分帧方式(kaldi 常规)一致
+  bool snip_edges = true;
   float frame_shift_ms = 10.0f;   // in milliseconds.
   float frame_length_ms = 25.0f;  // in milliseconds.
   bool is_librosa = false;

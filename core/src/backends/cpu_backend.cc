@@ -92,6 +92,8 @@ public:
         m.num_threads = 4;
         m.provider = "cpu";
         m.debug = 0;
+        // 注: 梅尔滤波截止高频在 vendored sherpa features.h 中已改为
+        // 默认 0 (奈奎斯特频率), 与 paraformer 训练配置一致
 
         // Chinese + English (Latin) decoding; zh model already handles latin
         // characters via BPE tokens.
@@ -208,7 +210,9 @@ private:
     {
 
             // sherpa-onnx v1.10.30 的 C API 接收 float 采样, 且 sample_rate
-            // 位于第 2 个参数
+            // 位于第 2 个参数。paraformer 的 normalize_samples=false:
+            // FeatureExtractor 内部会把输入乘回 32768, 因此这里喂
+            // 归一化 [-1,1] 采样
             floats.resize(chunk.size());
             for (size_t i = 0; i < chunk.size(); ++i) {
                 floats[i] = chunk[i] / 32768.0f;
@@ -256,6 +260,12 @@ private:
                 SherpaOnnxDecodeOnlineStream(recognizer_, stream_);
                 const SherpaOnnxOnlineRecognizerResult* r =
                     SherpaOnnxGetOnlineStreamResult(recognizer_, stream_);
+                if (getenv("SSUB_CPU_DEBUG")) {
+                    fprintf(stderr, "cpu decode: text_len=%zu\n",
+                            r != nullptr && r->text != nullptr
+                                ? strlen(r->text)
+                                : -1);
+                }
                 if (r != nullptr && r->text != nullptr && r->text[0] != '\0') {
                     AsrResult res{r->text, false};
                     callback_(res);

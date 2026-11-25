@@ -90,10 +90,14 @@ class NpuBackend : public AsrBackend {
       }
     }
 
-    // 2) 特征提取配置: paraformer 要求样本保持原始 int16 量级
+    // 2) 特征提取配置: paraformer 要求样本保持原始 int16 量级;
+    // high_freq 默认 -400 会把梅尔滤波截止到 7600Hz, 与训练配置
+    // (全频带 8000Hz)不符导致识别退化, 显式取 0 (奈奎斯特频率)
     sherpa_onnx::FeatureExtractorConfig feat_cfg;
     feat_cfg.feature_dim = 80;
     feat_cfg.normalize_samples = false;
+    feat_cfg.high_freq = 0.0f;
+    feat_cfg.snip_edges = true;  // 与 kaldi/训练配置一致的分帧方式
     stream_ = std::make_unique<sherpa_onnx::OnlineStream>(feat_cfg);
 
     // 3) RKNN 编码器
@@ -148,9 +152,10 @@ class NpuBackend : public AsrBackend {
 
   void Feed(const int16_t* pcm, size_t samples) override {
     std::vector<float> floats(samples);
-    // normalize_samples=false: 保持原始 int16 量级
+    // normalize_samples=false 时 FeatureExtractor 内部会把输入乘回
+    // 32768, 因此这里喂归一化 [-1,1] 采样
     for (size_t i = 0; i < samples; i++) {
-      floats[i] = pcm[i];
+      floats[i] = pcm[i] / 32768.0f;
     }
     std::lock_guard<std::mutex> lk(stream_mu_);
     stream_->AcceptWaveform(kSampleRate, floats.data(),
@@ -251,18 +256,49 @@ class NpuBackend : public AsrBackend {
 
   void ProcessChunk() {
     std::vector<float> frames;
+    int32_t processed_before;
     {
       std::lock_guard<std::mutex> lk(stream_mu_);
       frames = stream_->GetFrames(num_processed_, kChunkFrames);
+      processed_before = num_processed_;
       num_processed_ += kChunkFrames - 1;
+    }
+    if (getenv("SSUB_NPU_DUMP_RAW")) {
+      // 导出原始 fbank 帧 (LFR/CMVN/PE 前), 用于与主机参考对比
+      char p[160];
+      snprintf(p, sizeof(p), "/data/local/tmp/npu/calib/raw_%03d.bin",
+               processed_before);
+      FILE* fp = fopen(p, "wb");
+      if (fp) {
+        fwrite(frames.data(), sizeof(float), frames.size(), fp);
+        fclose(fp);
+      }
     }
     if (getenv("SSUB_NPU_DEBUG")) {
       fprintf(stderr, "npu: ProcessChunk frames=%zu\n", frames.size() / 80);
     }
 
     frames = ApplyLFR(frames);
+    float pre_cmvn_mean0 = 0, pre_cmvn_std0 = 0;
+    if (getenv("SSUB_NPU_DEBUG")) {
+        // 统计 CMVN 前第 0 维均值/方差, 与模型元数据 neg_mean/inv_stddev 对照
+        size_t n_frames = frames.size() / feat_dim_;
+        float sum = 0, sq = 0;
+        for (size_t i = 0; i < frames.size(); i += feat_dim_) {
+            sum += frames[i];
+            sq += frames[i] * frames[i];
+        }
+        pre_cmvn_mean0 = sum / n_frames;
+        pre_cmvn_std0 = std::sqrt(sq / n_frames -
+                                  pre_cmvn_mean0 * pre_cmvn_mean0);
+        fprintf(stderr,
+                "npu: pre-CMVN dim0 mean=%.3f std=%.3f (model: -%.3f/%.3f)\n",
+                pre_cmvn_mean0, pre_cmvn_std0,
+                -model_->NegativeMean()[0], model_->InverseStdDev()[0]);
+    }
     ApplyCMVN(&frames);
-    PositionalEncoding(&frames, num_processed_ / model_->LfrWindowShift());
+    // PE 偏移使用递增前的帧数 (与 sherpa 一致)
+    PositionalEncoding(&frames, processed_before / model_->LfrWindowShift());
     if (getenv("SSUB_NPU_DEBUG")) {
       float s = 0;
       for (float f : frames) {
