@@ -23,3 +23,6 @@ export function feedAudio(pcm: ArrayBuffer): void;
 
 /** Return the last backend error (empty string when none). */
 export function getLastError(): string;
+
+/** Preload the RKNN runtime (idempotent; call once from the main thread). */
+export function preloadRuntime(): void;

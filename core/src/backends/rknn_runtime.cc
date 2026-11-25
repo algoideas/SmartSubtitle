@@ -21,8 +21,19 @@ void* RknnRtHandle()
     static void* handle = nullptr;
     static std::once_flag once;
     std::call_once(once, []() {
-        // dlopen 失败时保持 nullptr, 调用方返回 RKNN_ERR 并在上层报错
-        handle = dlopen("librknnrt.so", RTLD_NOW | RTLD_LOCAL);
+        // 依次尝试: 板卡 CLI 验证过的运行时 → 应用沙箱内未 strip 副本 →
+        // 打包 so; 全部失败时保持 nullptr, 调用方返回 RKNN_ERR 并在上层报错
+        const char* candidates[] = {
+            "/data/local/tmp/npu/librknnrt.so",
+            "/data/app/el2/100/base/com.ohos.smartsubtitle/files/librknnrt.so",
+            "librknnrt.so",
+        };
+        for (const char* path : candidates) {
+            handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+            if (handle != nullptr) {
+                break;
+            }
+        }
     });
     return handle;
 }
@@ -36,6 +47,13 @@ void* Resolve(const char* name)
 }  // namespace
 
 extern "C" {
+
+// 供主线程预加载调用: 在 Worker 之外先完成 librknnrt.so 的加载,
+// 规避 Worker 线程 dlopen 触发 musl 符号解析崩溃的问题
+void SmartSubtitlePreloadRknnRuntime()
+{
+    RknnRtHandle();
+}
 
 int rknn_init(rknn_context* context, void* model, uint32_t size, uint32_t flag,
               rknn_init_extend* extend)

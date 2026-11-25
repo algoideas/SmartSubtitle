@@ -16,12 +16,25 @@
 
 #include "asr_backend.h"
 
+// rknn_runtime.cc: 主线程预加载 RKNN 运行时, 规避 Worker 线程
+// dlopen 触发 musl 符号解析崩溃
+extern "C" void SmartSubtitlePreloadRknnRuntime();
+
 namespace {
 
 using subtitle::AsrCallback;
 using subtitle::AsrResult;
 using subtitle::BackendConfig;
 using subtitle::CreateBackend;
+
+// 主线程预加载 RKNN 运行时(幂等)
+napi_value PreloadRuntime(napi_env env, napi_callback_info /*info*/)
+{
+    SmartSubtitlePreloadRknnRuntime();
+    napi_value undefined;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+}
 
 struct EngineState {
     std::unique_ptr<subtitle::AsrBackend> backend;
@@ -148,6 +161,7 @@ napi_value Init(napi_env env, napi_value exports)
         {"stopEngine", nullptr, StopEngine, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"feedAudio", nullptr, FeedAudio, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getLastError", nullptr, GetLastError, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"preloadRuntime", nullptr, PreloadRuntime, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;

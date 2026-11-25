@@ -30,6 +30,8 @@ struct Index {
   @State envChecking: boolean = false;
   // 断点判定(HarmonyOS 规范: md >= 600vp): 宽屏时设置卡片与字幕区双栏并排
   @State isWide: boolean = false;
+  // 页面左右留白随断点分级: sm 16vp / md 24vp / lg 48vp
+  @State pagePadding: number = 16;
 
   // 当前推理后端的显示文本(与 backend 状态联动)
   private getBackendLabel(): string {
@@ -456,6 +458,7 @@ struct Index {
             this.actionButtons()
           }
           .layoutWeight(1)
+          .margin({ left: 24 })
         }
         .layoutWeight(1)
         .alignItems(VerticalAlign.Top)
@@ -469,11 +472,13 @@ struct Index {
     }
     .width('100%')
     .height('100%')
-    .padding({ left: 16, right: 16 })
+    .padding({ left: this.pagePadding, right: this.pagePadding })
     .backgroundColor('#12121E')
     .onAreaChange((_old: Area, area: Area) => {
-      // HarmonyOS 断点: md >= 600vp
-      this.isWide = Number(area.width) >= 600;
+      // HarmonyOS 断点: md >= 600vp, lg >= 840vp; 留白分级 16/24/32vp
+      const w = Number(area.width);
+      this.isWide = w >= 600;
+      this.pagePadding = w >= 840 ? 48 : (w >= 600 ? 24 : 16);
     })
   }
 }

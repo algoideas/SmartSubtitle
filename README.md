@@ -177,6 +177,15 @@ entry/src/main/cpp/third_party/sherpa-onnx/
 
 目标：把 Paraformer 编码器经 RKNN 转换后跑在 RK3588 的 NPU 上，降低 CPU 占用与功耗。
 
+
+### HAP 内 NPU 的已知限制
+
+HAP 应用进程内通过 dlopen 加载 `librknnrt.so` 在部分 RK3588 板卡（如 Orange Pi 5B, OpenHarmony 6.1）上会触发系统 musl 动态链接器符号解析崩溃（WorkerThread/MainThread `find_sym2` SIGSEGV，见 faultlogger），与 CPU 后端无关，应用侧无法规避。因此：
+
+- HAP 的 NPU 环境检查/推理在该类设备上不可用（应用会崩溃退出）；
+- NPU 推理验证请使用独立进程的 `smartsubtitle_cli`（已验证，见下文）；
+- 应用内选择 NPU 后端前请先在目标设备用 CLI 确认可加载 `librknnrt.so`。
+
 ### 1. x86 主机安装 rknn-toolkit2（模型转换用）
 
 ```bash
