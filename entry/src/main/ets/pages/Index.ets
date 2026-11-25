@@ -265,8 +265,7 @@ struct Index {
           ])
       }
       .width('100%')
-      .padding({ left: 16, right: 16 })
-      .margin({ top: 12, bottom: 16 })
+      .padding({ top: 12, bottom: 16 })
       .alignItems(VerticalAlign.Center)
 
       // 设置卡片: 推理后端 / 字幕语言 (同一卡片, 控件等高)
@@ -276,23 +275,33 @@ struct Index {
             .fontSize(14)
             .fontColor('#A0A0B0')
           Blank()
-          Select([
-            { value: 'CPU (sherpa-onnx)' },
-            { value: 'NPU (RK3588)' }
-          ])
-            .value(this.backend === 'cpu' ? 'CPU (sherpa-onnx)' : 'NPU (RK3588)')
-            .selected(this.backend === 'cpu' ? 0 : 1)
-            .enabled(!this.running)
-            .onSelect((index: number) => {
-              this.backend = index === 0 ? 'cpu' : 'npu';
-            })
+          // Select 不支持文字对齐, 用居中 Text + 下拉菜单实现
+          Text(this.backend === 'cpu' ? 'CPU (sherpa-onnx)' : 'NPU (RK3588)')
+            .fontSize(14)
             .fontColor('#E6F2FF')
-            .optionFontColor('#E6F2FF')
-            .optionBgColor('#26263A')
+            .textAlign(TextAlign.Center)
             .backgroundColor('#26263A')
             .borderRadius(8)
             .height(40)
             .width('55%')
+            .bindMenu([
+              {
+                value: 'CPU (sherpa-onnx)',
+                action: () => {
+                  if (!this.running) {
+                    this.backend = 'cpu';
+                  }
+                }
+              },
+              {
+                value: 'NPU (RK3588)',
+                action: () => {
+                  if (!this.running) {
+                    this.backend = 'npu';
+                  }
+                }
+              }
+            ])
         }
         .width('100%')
         .height(48)
@@ -315,7 +324,8 @@ struct Index {
         .height(48)
         .alignItems(VerticalAlign.Center)
       }
-      .width('92%')
+      .width('100%')
+      .constraintSize({ maxWidth: 640 })
       .padding({ left: 16, right: 16, top: 12, bottom: 12 })
       .backgroundColor('#1A1A2E')
       .borderRadius(16)
@@ -369,7 +379,8 @@ struct Index {
         .scrollBar(BarState.Off)
       }
       .layoutWeight(1)
-      .width('92%')
+      .width('100%')
+      .constraintSize({ maxWidth: 640 })
       .padding(12)
       .margin({ bottom: 8 })
       .backgroundColor('#1A1A2E')
@@ -378,7 +389,8 @@ struct Index {
 
       // 环境检查: 位于开始识别上方, 识别预制 0.wav 验证端到端链路
       Button(this.envChecking ? '检查中…' : '环境检查')
-        .width('70%')
+        .width('100%')
+        .constraintSize({ maxWidth: 400 })
         .height(40)
         .fontSize(14)
         .fontColor('#E6F2FF')
@@ -391,7 +403,8 @@ struct Index {
         })
 
       Button(this.running ? '停止' : '开始识别')
-        .width('70%')
+        .width('100%')
+        .constraintSize({ maxWidth: 400 })
         .height(48)
         .fontSize(16)
         .fontColor('#FFFFFF')
@@ -417,6 +430,7 @@ struct Index {
     }
     .width('100%')
     .height('100%')
+    .padding({ left: 16, right: 16 })
     .backgroundColor('#12121E')
   }
 }
