@@ -18,11 +18,30 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -Wno-int-conversion -Wno-writ
 #   third_party/rknpu/include       + third_party/rknpu/libs/${OHOS_ARCH}
 set(SHERPA_ONNX_DIR ${NATIVERENDER_ROOT_PATH}/third_party/sherpa-onnx)
 set(RKNPU_DIR ${NATIVERENDER_ROOT_PATH}/third_party/rknpu)
+if(NOT EXISTS ${RKNPU_DIR}/include)
+    # 回退: 仓库根 third_party/rknn (librknnrt.so 取自 rknn-toolkit2 v2.1.0)
+    set(RKNPU_DIR ${NATIVERENDER_ROOT_PATH}/third_party/rknn)
+endif()
+
+# 双编码器管线的 npu_backend.cc 引用 sherpa csrc 头文件与
+# onnxruntime C++ 头文件, 来自仓库内 sherpa-onnx 源码树与
+# build-ohos 的依赖子树 (kaldi-decoder/kaldi-native-fbank/openfst/eigen)
+set(SHERPA_SOURCE_ROOT ${NATIVERENDER_ROOT_PATH}/../../../../third_party/sherpa-onnx)
+set(SHERPA_DEPS ${SHERPA_SOURCE_ROOT}/build-ohos/_deps)
 
 include_directories(
     ${CORE_ROOT}/include/subtitle
     ${SHERPA_ONNX_DIR}/include
     ${RKNPU_DIR}/include
+    ${SHERPA_SOURCE_ROOT}
+    ${SHERPA_SOURCE_ROOT}/sherpa-onnx
+    ${SHERPA_DEPS}/onnxruntime-src/include
+    ${SHERPA_DEPS}/kaldi_decoder-src
+    ${SHERPA_DEPS}/kaldi_native_fbank-src
+    ${SHERPA_DEPS}/kaldifst-src
+    ${SHERPA_DEPS}/openfst-src/src/include
+    ${SHERPA_DEPS}/eigen-src
+    ${SHERPA_DEPS}/simple-sentencepiece-src
 )
 
 add_library(entry SHARED

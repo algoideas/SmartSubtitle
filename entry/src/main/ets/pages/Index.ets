@@ -27,6 +27,7 @@ struct Index {
   @State captions: Caption[] = [];
   @State lastError: string = '';
   @State buttonPressed: boolean = false;
+  @State envChecking: boolean = false;
 
   private audioCapturer: audio.AudioCapturer | null = null;
   private reading: boolean = false;
@@ -94,6 +95,73 @@ struct Index {
     return modelDir;
   }
 
+  // 环境检查用预制音频: rawfile/0.wav 复制到沙箱 filesDir(已存在且
+  // 大小一致则跳过)
+  private copyWavToSandbox(): string {
+    const context = getContext(this);
+    const dst = `${context.getApplicationContext().filesDir}/0.wav`;
+    const data = context.resourceManager.getRawFileContentSync('0.wav');
+    let exists = false;
+    if (fs.accessSync(dst)) {
+      const stat = fs.statSync(dst);
+      exists = stat.size === data.byteLength;
+    }
+    if (!exists) {
+      const fp = fs.openSync(dst, fs.OpenMode.WRITE_ONLY | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(fp.fd, buffer.from(data).buffer);
+      fs.closeSync(fp.fd);
+    }
+    return dst;
+  }
+
+  // 创建 Worker 并注册公共消息处理(识别结果/引擎状态)
+  private createWorker(): worker.ThreadWorker {
+    const w = new worker.ThreadWorker('entry/ets/workers/SubtitleWorker.ets');
+    w.onmessage = (e: MessageEvents) => {
+      const msg = e.data as Record<string, string | boolean>;
+      if (msg.type === 'result') {
+        this.onSubtitleUpdate(msg.text as string, msg.isFinal as boolean);
+      } else if (msg.type === 'started' && !(msg.ok as boolean)) {
+        this.lastError = '引擎初始化失败: ' + (msg.error as string);
+      } else if (msg.type === 'envcheck-done') {
+        this.envChecking = false;
+        if (!(msg.ok as boolean)) {
+          this.lastError = '环境检查失败: ' + (msg.error as string);
+        }
+        w.terminate();
+        if (this.subtitleWorker === w) {
+          this.subtitleWorker = null;
+        }
+      }
+    };
+    w.onerror = (e) => {
+      this.lastError = 'Worker 异常: ' + e.message;
+      this.envChecking = false;
+    };
+    return w;
+  }
+
+  // 环境检查: 复制预制 0.wav 到沙箱, 经 Worker �入引擎识别,
+  // 结果实时显示在字幕区; 完成后自动停止
+  async envCheck(): Promise<void> {
+    if (this.running || this.envChecking) {
+      return;
+    }
+    const modelDir = this.copyModelsToSandbox();
+    const wavPath = this.copyWavToSandbox();
+
+    this.subtitleWorker = this.createWorker();
+    this.envChecking = true;
+    this.lastError = '';
+    this.captions = [];
+    this.subtitleWorker.postMessage({
+      type: 'envcheck',
+      backend: this.backend,
+      modelDir: modelDir,
+      wavPath: wavPath
+    });
+  }
+
   async start(): Promise<void> {
     if (!(await this.requestMicPermission())) {
       this.lastError = '麦克风权限被拒绝';
@@ -104,18 +172,7 @@ struct Index {
     const modelDir = this.copyModelsToSandbox();
 
     // 耗时的原生引擎初始化与推理都在 Worker 线程执行
-    this.subtitleWorker = new worker.ThreadWorker('entry/ets/workers/SubtitleWorker.ets');
-    this.subtitleWorker.onmessage = (e: MessageEvents) => {
-      const msg = e.data as Record<string, string | boolean>;
-      if (msg.type === 'result') {
-        this.onSubtitleUpdate(msg.text as string, msg.isFinal as boolean);
-      } else if (msg.type === 'started' && !(msg.ok as boolean)) {
-        this.lastError = '引擎初始化失败: ' + (msg.error as string);
-      }
-    };
-    this.subtitleWorker.onerror = (e) => {
-      this.lastError = 'Worker 异常: ' + e.message;
-    };
+    this.subtitleWorker = this.createWorker();
     this.subtitleWorker.postMessage({
       type: 'init',
       backend: this.backend,
@@ -314,7 +371,7 @@ struct Index {
         .fontColor('#FFFFFF')
         .backgroundColor(this.running ? '#C8402F' : '#0A59F7')
         .borderRadius(24)
-        .margin({ top: 8, bottom: 24 })
+        .margin({ top: 8 })
         .onTouch((event: TouchEvent) => {
           // 按压反馈: 按下时降低不透明度, 符合 HarmonyOS 交互规范
           if (event.type === TouchType.Down) {
@@ -330,6 +387,19 @@ struct Index {
           } else {
             this.start();
           }
+        })
+
+      Button(this.envChecking ? '检查中…' : '环境检查')
+        .width('70%')
+        .height(40)
+        .fontSize(14)
+        .fontColor('#E6F2FF')
+        .backgroundColor('#26263A')
+        .borderRadius(20)
+        .margin({ top: 8, bottom: 24 })
+        .enabled(!this.running && !this.envChecking)
+        .onClick(() => {
+          this.envCheck();
         })
     }
     .width('100%')
