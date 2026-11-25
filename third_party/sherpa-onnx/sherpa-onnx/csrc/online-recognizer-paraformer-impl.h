@@ -419,7 +419,10 @@ class OnlineRecognizerParaformerImpl : public OnlineRecognizerImpl {
 
     for (int32_t i = 0; i != num_frames; ++i) {
       for (int32_t k = 0; k != dim; ++k) {
-        p[k] = (p[k] + neg_mean[k]) * inv_stddev[k];
+        // 本地补丁: funasr 导出的 neg_mean 元数据按"待减均值"约定,
+        // 正确公式为 (v - neg_mean); 原实现 (v + neg_mean) 符号相反,
+        // 导致特征整体偏移、识别输出重复乱码。已用主机参考管线验证。
+        p[k] = (p[k] - neg_mean[k]) * inv_stddev[k];
       }
 
       p += dim;

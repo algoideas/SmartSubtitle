@@ -5,6 +5,7 @@
 // Endpointing uses sherpa-onnx's rule-based endpoint detector
 // (rule1/2/3 in OnlineRecognizerEndpointConfig).
 #include "cpu_backend.h"
+#include "npu_backend.h"
 
 #if __has_include("sherpa-onnx/c-api/c-api.h")
 
@@ -293,7 +294,8 @@ private:
 
 std::unique_ptr<AsrBackend> CreateCpuBackend()
 {
-    return std::make_unique<CpuBackend>();
+    // CPU 推理复用与 NPU 一致的已验证管线 (ManualFbank + ORT int8 编码器)
+    return CreateNpuBackend(true);
 }
 
 }  // namespace subtitle

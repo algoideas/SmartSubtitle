@@ -10,7 +10,7 @@
 
 namespace subtitle {
 
-std::unique_ptr<AsrBackend> CreateNpuBackend();
+std::unique_ptr<AsrBackend> CreateNpuBackend(bool use_ort = false);
 
 }  // namespace subtitle
 
