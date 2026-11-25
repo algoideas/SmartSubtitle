@@ -8,7 +8,7 @@
 namespace subtitle {
 
 std::unique_ptr<AsrBackend> CreateCpuBackend();
-std::unique_ptr<AsrBackend> CreateNpuBackend();
+std::unique_ptr<AsrBackend> CreateNpuBackend(bool use_ort = false);
 
 std::unique_ptr<AsrBackend> CreateBackend(const std::string& name)
 {
