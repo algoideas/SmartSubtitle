@@ -396,6 +396,7 @@ AudioCapturer(16k/16bit/单声道)
 4. **延迟偏高**：CPU 后端可将 `num_threads` 调至 4–6；确认使用的是 int8 量化模型；RK3588 上优先切换 NPU 后端。
 5. **识别结果全为空**：检查采样率是否为 16 kHz、声道是否为单声道；VAD 门控在持续静音时会主动丢弃音频，属于预期行为。
 6. **NPU float 编码器输出损坏（alphas 恒定 0.357、enc 含 inf）**：rknn-toolkit2 v2.1.0 转出的 float 编码器在 RK3588 NPU 上不可用（48 帧与 18 帧转换均复现），HAP 内请使用 int8 量化版本。另注意 int8 版 RKNN 输出的 alphas 总和较 ORT 参考系统性偏大（约 6 倍，rknn_alpha_sum≈7.9 vs ort≈1.2），该缩放偏差是 NPU 识别文本重复乱码的疑似主因，后续可从 CIF 门控归一化或混合量化方向改进。
+7. **rknn-toolkit2 v2.3.2 + mmse 量化实测无改善**：使用 v2.3.2 的 mmse 算法重转 int8 模型，其 alphas 逐帧输出与 v2.1.0 mmse 版完全一致（识别文本仍为 `</s></s></s>` 特殊 token），说明 alpha 分支的量化保真度问题与 toolkit 版本无关，需从转换图结构（如 CIF 门控归一化、混合精度量化）方向继续攻关。
 
 ## 许可
 
