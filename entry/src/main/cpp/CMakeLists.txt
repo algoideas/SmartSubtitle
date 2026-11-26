@@ -44,7 +44,6 @@ include_directories(
 
 add_library(entry SHARED
     napi_init.cpp
-    ${CORE_ROOT}/src/backends/rknn_runtime.cc
     ${CORE_ROOT}/src/backends/asr_backend.cpp
     ${CORE_ROOT}/src/backends/cpu_backend.cc
     ${CORE_ROOT}/src/backends/npu_backend.cc
@@ -79,8 +78,17 @@ if(EXISTS ${SHERPA_ONNX_DIR}/libs/arm64-v8a/libsherpa-onnx-c-api.a)
     target_link_libraries(entry PUBLIC -Wl,--no-as-needed -lc++)
 endif()
 
-# librknnrt.so 改为运行时 dlopen(rknn_runtime.cc), 避免链接期依赖
-# 导致 Worker 线程 dlopen(libentry.so) 崩溃; 头文件仍需 SSUB_HAS_RKNN
-if(EXISTS ${RKNPU_DIR}/include/rknn_api.h)
+# librknnrt.so 采用构建期链接(DT_NEEDED): 引擎在主线程驱动(Index.ets
+# startMainThreadEngine), 主线程加载正常; Worker 线程加载会触发 musl
+# dlopen 崩溃, 故 NPU 后端禁止在 Worker 中运行
+if(EXISTS ${RKNPU_DIR}/libs/arm64-v8a/librknnrt.so)
     target_compile_definitions(entry PRIVATE SSUB_HAS_RKNN=1)
+    target_link_libraries(entry PUBLIC
+        ${RKNPU_DIR}/libs/arm64-v8a/librknnrt.so
+    )
+elseif(EXISTS ${NATIVERENDER_ROOT_PATH}/third_party/rknn/libs/arm64-v8a/librknnrt.so)
+    target_compile_definitions(entry PRIVATE SSUB_HAS_RKNN=1)
+    target_link_libraries(entry PUBLIC
+        ${NATIVERENDER_ROOT_PATH}/third_party/rknn/libs/arm64-v8a/librknnrt.so
+    )
 endif()

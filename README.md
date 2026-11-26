@@ -178,13 +178,17 @@ entry/src/main/cpp/third_party/sherpa-onnx/
 目标：把 Paraformer 编码器经 RKNN 转换后跑在 RK3588 的 NPU 上，降低 CPU 占用与功耗。
 
 
-### HAP 内 NPU 的已知限制
+### HAP 内 NPU 的线程模型要求
 
-HAP 应用进程内通过 dlopen 加载 `librknnrt.so` 在部分 RK3588 板卡（如 Orange Pi 5B, OpenHarmony 6.1）上会触发系统 musl 动态链接器符号解析崩溃（WorkerThread/MainThread `find_sym2` SIGSEGV，见 faultlogger），与 CPU 后端无关，应用侧无法规避。因此：
+HAP 应用进程内通过 JS Worker 线程加载 `librknnrt.so` 在部分 RK3588 板卡（如 Orange Pi 5B, OpenHarmony 6.1）上会触发系统 musl 动态链接器符号解析崩溃（WorkerThread `find_sym2` SIGSEGV，见 faultlogger）。
 
-- HAP 的 NPU 环境检查/推理在该类设备上不可用（应用会崩溃退出）；
-- NPU 推理验证请使用独立进程的 `smartsubtitle_cli`（已验证，见下文）；
-- 应用内选择 NPU 后端前请先在目标设备用 CLI 确认可加载 `librknnrt.so`。
+**解决方案**（已实现）：引擎完全在主线程驱动（与参考实现 RknnFacialRecognitionDemo 一致，Worker 架构已移除）：
+
+- `librknnrt.so` 采用构建期链接（DT_NEEDED），随 `libentry.so` 在主线程加载；
+- NPU 环境检查与实时推理均在主线程调用 `startEngine`/`feedAudio`/`stopEngine`；
+- CPU 后端同样走主线程路径，两后端行为一致。
+
+注意：应用沙箱内目录（filesDir）与 `/data/local/tmp` 的运行时 dlopen 会被 OHOS 安全策略静默拒绝（返回 null），因此运行时 dlopen 方案不可行，必须使用构建期链接。
 
 ### 1. x86 主机安装 rknn-toolkit2（模型转换用）
 
