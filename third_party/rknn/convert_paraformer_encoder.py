@@ -33,6 +33,9 @@ def main() -> int:
                         help="编码器输入特征维度 (默认 560)")
     parser.add_argument("--dataset", default="",
                         help="量化校准样本列表 (可选; 提供后执行 int8 量化)")
+    parser.add_argument("--algorithm", default="normal",
+                        choices=["normal", "mmse", "kl_divergence"],
+                        help="int8 量化算法 (默认 normal)")
     args = parser.parse_args()
 
     rknn = RKNN(verbose=False)
@@ -43,6 +46,7 @@ def main() -> int:
     rknn.config(
         target_platform="rk3588",
         quantized_method="channel",
+        quantized_algorithm=args.algorithm,
         optimization_level=3,
     )
 
