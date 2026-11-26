@@ -173,6 +173,16 @@ class NpuBackend : public AsrBackend {
   }
 
   ~NpuBackend() {
+    // 尾部注入 ~0.4s 静音: 音频结束时剩余帧不足 LFR 堆叠窗口(7 帧),
+    // 滞留缓存永不编码, 末段 token(如"是星期三")会丢失; 注入静音补齐
+    // 窗口使尾部得以编码输出
+    {
+      std::vector<int16_t> silence(6400, 0);  // 400ms @16k
+      for (int i = 0; i < 4; ++i) {
+        std::lock_guard<std::mutex> lk(stream_mu_);
+        mf_->Feed(silence.data(), silence.size());
+      }
+    }
     // NPU 解码慢于实时: 停止前等待 DecodeLoop 处理完积压帧(有界),
     // 否则环境检查/短音频场景下结果尚未产出即被丢弃, 字幕为空
     for (int i = 0; i < 300; ++i) {  // 最多 ~30s
