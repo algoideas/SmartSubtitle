@@ -49,6 +49,12 @@ add_library(entry SHARED
     ${CORE_ROOT}/src/backends/npu_backend.cc
 )
 
+# 隐藏全部导出符号: 静态 sherpa/ORT 会导出数千符号, 部分 RK3588 板卡的
+# musl 加载器在解析 librknnrt.so 符号时遍历该表触发 find_sym2 崩溃;
+# NAPI 模块经构造函数注册, 不依赖导出符号
+target_compile_options(entry PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+target_link_options(entry PRIVATE -Wl,--exclude-libs,ALL)
+
 find_library(hilog-lib hilog_ndk.z)
 
 target_link_libraries(entry PUBLIC
@@ -90,5 +96,15 @@ elseif(EXISTS ${NATIVERENDER_ROOT_PATH}/third_party/rknn/libs/arm64-v8a/librknnr
     target_compile_definitions(entry PRIVATE SSUB_HAS_RKNN=1)
     target_link_libraries(entry PUBLIC
         ${NATIVERENDER_ROOT_PATH}/third_party/rknn/libs/arm64-v8a/librknnrt.so
+    )
+endif()
+
+# DT_NEEDED 依赖的 so 拷贝到 CMake 输出目录, 确保 hvigor 打包进 HAP
+# (否则 libentry.so 加载时因缺依赖静默失败, NAPI 导出全部不可用)
+if(EXISTS ${RKNPU_DIR}/libs/arm64-v8a/librknnrt.so)
+    add_custom_command(TARGET entry POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${RKNPU_DIR}/libs/arm64-v8a/librknnrt.so
+            ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/librknnrt.so
     )
 endif()

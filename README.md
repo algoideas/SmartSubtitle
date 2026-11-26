@@ -182,7 +182,7 @@ entry/src/main/cpp/third_party/sherpa-onnx/
 
 HAP 应用进程内通过 JS Worker 线程加载 `librknnrt.so` 在部分 RK3588 板卡（如 Orange Pi 5B, OpenHarmony 6.1）上会触发系统 musl 动态链接器符号解析崩溃（WorkerThread `find_sym2` SIGSEGV，见 faultlogger）。
 
-**解决方案**（已实现）：引擎完全在主线程驱动（与参考实现 RknnFacialRecognitionDemo 一致，Worker 架构已移除）：
+**解决方案**（已实现）：引擎完全在主线程驱动，Worker 架构已移除：
 
 - `librknnrt.so` 采用构建期链接（DT_NEEDED），随 `libentry.so` 在主线程加载；
 - NPU 环境检查与实时推理均在主线程调用 `startEngine`/`feedAudio`/`stopEngine`；
@@ -257,8 +257,7 @@ enc [1,18,512] + alphas → CIF 静音阈值搜索 → 声学嵌入 →
 
 ### 4. RK3588 板端部署（OpenHarmony）
 
-RKNN 运行时已内置在仓库 `third_party/rknn/`（头文件取自 OpenHarmony 样例
-`applications_ai_model_samples/RknnFacialRecognitionDemo_api12`，`librknnrt.so`
+RKNN 运行时已内置在仓库 `third_party/rknn/`（`librknnrt.so`
 取自 rknn-toolkit2 v2.1.0），构建时自动链接并打包进 HAP：
 
 ```bash

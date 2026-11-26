@@ -1,12 +1,10 @@
 import { audio } from '@kit.AudioKit';
 import abilityAccessCtrl from '@ohos.abilityAccessCtrl';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import worker, { MessageEvents } from '@ohos.worker';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { buffer } from '@kit.ArkTS';
 import { router } from '@kit.ArkUI';
-// 引擎在主线程直接驱动(与参考实现 RknnFacialRecognitionDemo 一致):
-// Worker 线程加载 librknnrt.so 会触发 musl dlopen 崩溃(见 README)
-import { getLastError, startEngine, stopEngine, feedAudio } from 'libentry.so';
 
 const TAG = 'SmartSubtitle';
 const SAMPLE_RATE = 16000;
@@ -42,9 +40,7 @@ struct Index {
 
   private audioCapturer: audio.AudioCapturer | null = null;
   private reading: boolean = false;
-  // NPU 后端在主线程驱动引擎: Worker 线程加载 librknnrt.so 会触发
-  // musl dlopen 崩溃(参考工程 RknnFacialRecognitionDemo 同为主线程模式)
-  private mainThreadEngine: boolean = false;
+  private subtitleWorker: worker.ThreadWorker | null = null;
 
   onSubtitleUpdate(text: string, isFinal: boolean): void {
     if (text.length === 0) {
@@ -127,78 +123,52 @@ struct Index {
     return dst;
   }
 
-  // 环境检查: 复制预制 0.wav 到沙箱, 经引擎识别, 结果实时显示在字幕区;
-  // 完成后自动停止
+  // 创建 Worker 并注册公共消息处理(识别结果/引擎状态)
+  private createWorker(): worker.ThreadWorker {
+    const w = new worker.ThreadWorker('entry/ets/workers/SubtitleWorker.ets');
+    w.onmessage = (e: MessageEvents) => {
+      const msg = e.data as Record<string, string | boolean>;
+      if (msg.type === 'result') {
+        this.onSubtitleUpdate(msg.text as string, msg.isFinal as boolean);
+      } else if (msg.type === 'started' && !(msg.ok as boolean)) {
+        this.lastError = '引擎初始化失败: ' + (msg.error as string);
+      } else if (msg.type === 'envcheck-done') {
+        this.envChecking = false;
+        if (!(msg.ok as boolean)) {
+          this.lastError = '环境检查失败: ' + (msg.error as string);
+        }
+        w.terminate();
+        if (this.subtitleWorker === w) {
+          this.subtitleWorker = null;
+        }
+      }
+    };
+    w.onerror = (e) => {
+      this.lastError = 'Worker 异常: ' + e.message;
+      this.envChecking = false;
+    };
+    return w;
+  }
+
+  // 环境检查: 复制预制 0.wav 到沙箱, 经 Worker 喂入引擎识别,
+  // 结果实时显示在字幕区; 完成后自动停止
   async envCheck(): Promise<void> {
     if (this.running || this.envChecking) {
       return;
     }
     const modelDir = this.copyModelsToSandbox();
-    // 主线程预加载 RKNN 运行时(沙箱内未 strip 副本)并启动引擎
     const wavPath = this.copyWavToSandbox();
 
-    this.startMainThreadEngine(modelDir);
+    this.subtitleWorker = this.createWorker();
     this.envChecking = true;
     this.lastError = '';
     this.captions = [];
-    this.feedWavOnMainThread(wavPath);
-  }
-
-  // 主线程启动引擎(NPU 后端专用)
-  private startMainThreadEngine(modelDir: string): void {
-    this.mainThreadEngine = true;
-    const ok = startEngine(this.backend, modelDir, (text: string, isFinal: boolean) => {
-      this.onSubtitleUpdate(text, isFinal);
+    this.subtitleWorker.postMessage({
+      type: 'envcheck',
+      backend: this.backend,
+      modelDir: modelDir,
+      wavPath: wavPath
     });
-    if (!ok) {
-      this.mainThreadEngine = false;
-      this.lastError = '引擎初始化失败: ' + getLastError();
-    }
-  }
-
-  // 主线程按实时节奏喂入 0.wav, 喂完后排水并停止引擎(NPU 环境检查)
-  private feedWavOnMainThread(wavPath: string): void {
-    const stat = fs.statSync(wavPath);
-    const data = new ArrayBuffer(stat.size);
-    const file = fs.openSync(wavPath, fs.OpenMode.READ_ONLY);
-    fs.readSync(file.fd, data);
-    fs.closeSync(file);
-    // 跳过 RIFF 头, 扫描 data 块 (demo 导出的 wav 头长 44 字节)
-    const u8 = new Uint8Array(data);
-    let off = -1;
-    for (let i = 0; i < 200 && i + 8 < u8.length; i++) {
-      if (u8[i] === 0x64 && u8[i + 1] === 0x61 && u8[i + 2] === 0x74 &&
-        u8[i + 3] === 0x61) {
-        off = i + 8;
-        break;
-      }
-    }
-    if (off < 0) {
-      stopEngine();
-      this.mainThreadEngine = false;
-      this.envChecking = false;
-      this.lastError = 'wav data chunk not found';
-      return;
-    }
-    // 1600 样本(100ms)/块, 按 100ms 间隔喂入, 喂完排水 2 秒后停止
-    const CHUNK_BYTES = 3200;
-    const end = u8.length;
-    const timer = setInterval(() => {
-      if (off >= end || !this.envChecking) {
-        clearInterval(timer);
-        setTimeout(() => {
-          if (this.mainThreadEngine) {
-            stopEngine();
-            this.mainThreadEngine = false;
-          }
-          this.envChecking = false;
-        }, 2000);
-        return;
-      }
-      const stop = Math.min(off + CHUNK_BYTES, end);
-      feedAudio(data.slice(off, stop));
-      off = stop;
-    }, 100);
   }
 
   async start(): Promise<void> {
@@ -209,19 +179,23 @@ struct Index {
 
     // 模型预置加载
     const modelDir = this.copyModelsToSandbox();
-    // 主线程预加载 RKNN 运行时(沙箱内未 strip 副本)并启动引擎
-    this.startMainThreadEngine(modelDir);
-    if (this.lastError !== '') {
-      return;
-    }
+
+    // 耗时的原生引擎初始化与推理都在 Worker 线程执行
+    this.subtitleWorker = this.createWorker();
+    this.subtitleWorker.postMessage({
+      type: 'init',
+      backend: this.backend,
+      modelDir: modelDir
+    });
 
     try {
       await this.startCapture();
       this.running = true;
       this.lastError = '';
     } catch (e) {
-      stopEngine();
-      this.mainThreadEngine = false;
+      this.subtitleWorker.postMessage({ type: 'stop' });
+      this.subtitleWorker.terminate();
+      this.subtitleWorker = null;
       this.lastError = '启动音频采集失败: ' + JSON.stringify(e);
     }
   }
@@ -245,9 +219,9 @@ struct Index {
     this.audioCapturer = await audio.createAudioCapturer(options);
     this.reading = true;
     this.audioCapturer.on('readData', (pcm: ArrayBuffer) => {
-      if (this.reading && pcm.byteLength > 0) {
-        // 引擎在主线程直接驱动(与参考实现 RknnFacialRecognitionDemo 一致)
-        feedAudio(pcm.slice(0));
+      if (this.reading && pcm.byteLength > 0 && this.subtitleWorker) {
+        // 采集缓冲为外部内存, Worker 序列化不支持直接克隆, 先拷贝再发送
+        this.subtitleWorker.postMessage({ type: 'pcm', buffer: pcm.slice(0) });
       }
     });
     await this.audioCapturer.start();
@@ -262,9 +236,11 @@ struct Index {
         this.audioCapturer = null;
       }
     } finally {
-      // 引擎在主线程直接驱动, 直接停止
-      stopEngine();
-      this.mainThreadEngine = false;
+      if (this.subtitleWorker) {
+        this.subtitleWorker.postMessage({ type: 'stop' });
+        this.subtitleWorker.terminate();
+        this.subtitleWorker = null;
+      }
       this.running = false;
     }
   }

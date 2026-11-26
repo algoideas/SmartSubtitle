@@ -14,6 +14,8 @@
 #include <string>
 #include <thread>
 
+#include <hilog/log.h>
+
 #include "asr_backend.h"
 
 namespace {
@@ -22,6 +24,8 @@ using subtitle::AsrCallback;
 using subtitle::AsrResult;
 using subtitle::BackendConfig;
 using subtitle::CreateBackend;
+
+#define NAPI_LOGD(...) OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "SubNapi", __VA_ARGS__)
 
 struct EngineState {
     std::unique_ptr<subtitle::AsrBackend> backend;
@@ -67,6 +71,8 @@ napi_value StartEngine(napi_env env, napi_callback_info info)
 
     std::string backendName = NapiToString(env, argv[0]);
     std::string modelDir = NapiToString(env, argv[1]);
+    NAPI_LOGD("StartEngine enter, backend=%{public}s dir=%{public}s",
+              backendName.c_str(), modelDir.c_str());
 
     g_engine.backend = CreateBackend(backendName);
 
@@ -100,6 +106,8 @@ napi_value StartEngine(napi_env env, napi_callback_info info)
         g_engine.lastError = g_engine.backend->LastError();
         g_engine.backend.reset();
     }
+    NAPI_LOGD("StartEngine Init done, ok=%{public)d err=%{public}s",
+              ok ? 1 : 0, g_engine.lastError.c_str());
     napi_value result;
     napi_get_boolean(env, ok, &result);
     return result;
@@ -119,6 +127,10 @@ napi_value StopEngine(napi_env env, napi_callback_info /*info*/)
 
 napi_value FeedAudio(napi_env env, napi_callback_info info)
 {
+    static int feedCount = 0;
+    if ((++feedCount % 25) == 1) {
+        NAPI_LOGD("FeedAudio call #%{public}d", feedCount);
+    }
     size_t argc = 1;
     napi_value argv[1];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);

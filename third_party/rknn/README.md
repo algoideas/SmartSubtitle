@@ -17,7 +17,7 @@ rknn/
 | 文件 | 版本/来源 |
 |---|---|
 | librknnrt.so | rknn-toolkit2 v2.4.1 (`rknpu2/runtime/Linux/libarm64/librknnrt.so`) |
-| rknn_api.h 等 | RknnFacialRecognitionDemo_api12 样例工程 |
+| rknn_api.h 等 | rknn-toolkit2 配套 API 头文件 |
 | convert_paraformer_encoder.py | 本项目编写, 依赖 rknn-toolkit2 v2.1.0+ |
 
 `librknnrt.so` 的 ELF 为 aarch64 (OpenHarmony musl 构建), 依赖
