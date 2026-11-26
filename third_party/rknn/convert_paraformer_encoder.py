@@ -36,6 +36,12 @@ def main() -> int:
     parser.add_argument("--algorithm", default="normal",
                         choices=["normal", "mmse", "kl_divergence"],
                         help="int8 量化算法 (默认 normal)")
+    parser.add_argument("--float-layers", default="",
+                        help="逗号分隔的层输出名列表, 这些层保持 fp16 不量化"
+                             " (custom_quantize_layers)")
+    parser.add_argument("--hybrid", action="store_true",
+                        help="使用混合量化两步流程(step1+cfg+step2), 需同时"
+                             "提供 --dataset 与 --float-layers")
     args = parser.parse_args()
 
     rknn = RKNN(verbose=False)
@@ -43,12 +49,15 @@ def main() -> int:
     print("-- 配置 target_platform=rk3588")
     # 输入特征已在上游归一化, 不再设置 mean/std
     # (RKNN 要求 mean/std 长度与输入帧数一致, 非图像模型不适用)
-    rknn.config(
+    cfg_kwargs = dict(
         target_platform="rk3588",
         quantized_method="channel",
         quantized_algorithm=args.algorithm,
         optimization_level=3,
     )
+    # 注: v2.3.2 不支持 config(custom_quantize_layers); --float-layers 在
+    # --hybrid 模式下改由 hybrid_quantization_step1 生成的 cfg 文件处理
+    rknn.config(**cfg_kwargs)
 
     print("-- 加载 ONNX (固定输入 [1, %d, %d]): %s"
           % (args.frames, args.feat_dim, args.onnx))
@@ -94,12 +103,47 @@ def main() -> int:
         print("load_onnx 失败, ret =", ret, file=sys.stderr)
         return 1
 
-    print("-- 构建模型" + (" (int8 量化)" if args.dataset else " (float)"))
-    ret = rknn.build(do_quantization=bool(args.dataset),
-                     dataset=args.dataset if args.dataset else None)
-    if ret != 0:
-        print("build 失败, ret =", ret, file=sys.stderr)
-        return 1
+    if args.hybrid and args.dataset and args.float_layers:
+        # 混合量化两步流程: step1 生成量化配置 -> 将指定层改为 float16 ->
+        # step2 以该配置重建模型。用于 alpha 分支等量化敏感层定向保精度。
+        print("-- 混合量化 step1 (校准):", args.dataset)
+        ret = rknn.hybrid_quantization_step1(dataset=args.dataset)
+        if ret != 0:
+            print("step1 失败, ret =", ret, file=sys.stderr)
+            return 1
+
+        import glob as _glob
+        cfg_files = _glob.glob("*.quantization.cfg")
+        if not cfg_files:
+            print("未找到 quantization.cfg", file=sys.stderr)
+            return 1
+        cfg_path = cfg_files[0]
+        float_names = [x.strip() for x in args.float_layers.split(",")
+                       if x.strip()]
+        print("-- 将以下层改为 float16:", float_names)
+        out_lines = []
+        for line in open(cfg_path):
+            if any(name in line for name in float_names):
+                print("   fp16 <-", line.strip())
+                line = line.rsplit(None, 1)[0] + " float16\n"
+            out_lines.append(line)
+        open(cfg_path, "w").write("".join(out_lines))
+
+        model_input = cfg_path.replace(".quantization.cfg", ".model")
+        print("-- 混合量化 step2")
+        ret = rknn.hybrid_quantization_step2(
+            model_input=model_input, data_input=args.dataset,
+            model_quantization_cfg=cfg_path)
+        if ret != 0:
+            print("step2 失败, ret =", ret, file=sys.stderr)
+            return 1
+    else:
+        print("-- 构建模型" + (" (int8 量化)" if args.dataset else " (float)"))
+        ret = rknn.build(do_quantization=bool(args.dataset),
+                         dataset=args.dataset if args.dataset else None)
+        if ret != 0:
+            print("build 失败, ret =", ret, file=sys.stderr)
+            return 1
 
     print("-- 导出:", args.output)
     ret = rknn.export_rknn(args.output)
