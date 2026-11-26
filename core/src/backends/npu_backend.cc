@@ -173,6 +173,19 @@ class NpuBackend : public AsrBackend {
   }
 
   ~NpuBackend() {
+    // NPU 解码慢于实时: 停止前等待 DecodeLoop 处理完积压帧(有界),
+    // 否则环境检查/短音频场景下结果尚未产出即被丢弃, 字幕为空
+    for (int i = 0; i < 300; ++i) {  // 最多 ~30s
+      bool drained = false;
+      {
+        std::lock_guard<std::mutex> lk(stream_mu_);
+        drained = mf_->AvailableFrames() < num_processed_ + kChunkFrames;
+      }
+      if (drained) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     running_ = false;
     if (worker_.joinable()) {
       worker_.join();
