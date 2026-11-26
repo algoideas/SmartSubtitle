@@ -564,6 +564,13 @@ class NpuBackend : public AsrBackend {
       for (int32_t i = 0; i != num_frames; ++i) {
         ref_alpha_sum += ref_alpha[i];
       }
+      if (getenv("SSUB_NPU_DEBUG")) {
+        fprintf(stderr, "npu ref: ort_alpha vec=[");
+        for (int32_t i = 0; i != num_frames; ++i) {
+          fprintf(stderr, "%s%.3f", i ? "," : "", ref_alpha[i]);
+        }
+        fprintf(stderr, "]\n");
+      }
       fprintf(stderr,
               "npu ref: ort_alpha_sum=%.3f rknn_alpha_sum=%.3f "
               "enc_max_diff=%.4f ort_enc_abs_sum=%.1f\n",
