@@ -85,7 +85,7 @@ struct Index {
     if (!fs.accessSync(modelDir)) {
       fs.mkdirSync(modelDir, true);
     }
-    const names = ['encoder.int8.onnx', 'decoder.int8.onnx', 'tokens.txt', 'silero_vad.onnx'];
+    const names = ['encoder.int8.onnx', 'decoder.int8.onnx', 'tokens.txt', 'silero_vad.onnx', 'paraformer-encoder.rknn'];
     for (const name of names) {
       const raw = `${RAWFILE_MODEL_DIR}/${name}`;
       const dst = `${modelDir}/${name}`;

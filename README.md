@@ -267,6 +267,11 @@ entry/src/main/cpp/third_party/rknn/   # 构建时 entry 侧使用的副本
 entry/libs/arm64-v8a/librknnrt.so      # 打包进 HAP 的运行时库
 ```
 
+NPU 编码器模型 `paraformer-encoder.rknn`（float, ~326MB）随 HAP
+一起打包（置于 `entry/src/main/resources/rawfile/models/`），应用启动
+后由 `copyModelsToSandbox` 自动拷贝到沙箱，无需手工部署；该二进制体积
+过大不入仓库，构建前需按第 3 节完成 RKNN 转换后复制到该目录。
+
 模型文件部署到 RK3588 板端（OpenHarmony）：
 
 ```bash
