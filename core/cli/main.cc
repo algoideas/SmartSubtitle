@@ -60,8 +60,16 @@ bool LoadWav(const std::string& path, std::vector<int16_t>& pcm)
     if (!f || std::memcmp(header, "RIFF", 4) != 0) {
         return false;
     }
-    pcm.assign(std::istreambuf_iterator<char>(f), {});
-    return true;
+    // 数据块为 16-bit LE PCM: 必须两字节合并为一个 int16 样本。
+    // (旧实现 istreambuf_iterator<char> 逐字节值扩展, 使样本数翻倍、
+    // 值域变成 0..255 的字节流, 特征全错 —— 板卡 CLI 乱码的根因)
+    std::vector<char> bytes(std::istreambuf_iterator<char>(f),
+                            (std::istreambuf_iterator<char>()));
+    pcm.resize(bytes.size() / 2);
+    if (!pcm.empty()) {
+        std::memcpy(pcm.data(), bytes.data(), pcm.size() * sizeof(int16_t));
+    }
+    return !pcm.empty();
 }
 
 void Run(subtitle::AsrBackend& backend, const std::vector<int16_t>& pcm)

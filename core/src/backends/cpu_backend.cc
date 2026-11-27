@@ -170,6 +170,19 @@ public:
 
     ~CpuBackend()
     {
+        // 尾部注入 3s 静音: 端点检测按"2.4s 尾随静音"规则收尾, 最后一句
+        // 若不等静音即停止会整体丢失; 逐段推送并等待解码排空
+        for (int i = 0; i < 6; ++i) {
+            std::vector<int16_t> silence(8000, 0);  // 0.5s @16k
+            ring_.Push(silence.data(), silence.size());
+            for (int j = 0; j < 200; ++j) {
+                std::vector<int16_t> dummy;
+                if (ring_.Pop(dummy) == 0) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        }
         running_ = false;
         if (worker_.joinable()) {
             worker_.join();
@@ -294,7 +307,14 @@ private:
 
 std::unique_ptr<AsrBackend> CreateCpuBackend()
 {
-    // CPU 推理复用与 NPU 一致的已验证管线 (ManualFbank + ORT int8 编码器)
+    // CPU 推理默认采用手动管线 (ManualFbank + ORT int8 编码器, 与 NPU
+    // 后端同一条特征/解码路径): 上板实测输出完整(含句首与句尾末字),
+    // 优于 sherpa C API 参考管线(丢句首约 2.5s 与句尾末字)。
+    // SSUB_CPU_REF_PIPELINE=1 切回 sherpa 参考管线 (OnlineRecognizer +
+    // 端点检测 + VAD) 用于对比。
+    if (getenv("SSUB_CPU_REF_PIPELINE") != nullptr) {
+        return std::make_unique<CpuBackend>();
+    }
     return CreateNpuBackend(true);
 }
 

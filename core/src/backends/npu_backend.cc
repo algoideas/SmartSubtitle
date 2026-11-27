@@ -247,9 +247,12 @@ class NpuBackend : public AsrBackend {
     float* p = v->data();
     for (int32_t i = 0; i != num_frames; ++i) {
       for (int32_t k = 0; k != dim; ++k) {
-        // 恢复上游公式 (v + neg_mean): 实测两种符号下编码器行为
-        // 均异常, 上游公式特征量级合理且为经过上游验证的路径
-        p[k] = (p[k] + neg_mean[k]) * inv_stddev[k];
+        // funasr 导出的 neg_mean 元数据按"待减均值"约定, 正确公式为
+        // (v - neg_mean) * inv_stddev (与 vendored 参考
+        // online-recognizer-paraformer-impl.h ApplyCMVN 一致)。
+        // 误用 (v + neg_mean) 会使特征整体偏移 2*neg_mean, 编码器
+        // 输出退化为"首帧质量+末帧 1.0"边界态, CIF 积分永不触发, 无 token。
+        p[k] = (p[k] - neg_mean[k]) * inv_stddev[k];
       }
       p += dim;
     }
@@ -295,6 +298,19 @@ class NpuBackend : public AsrBackend {
         fwrite(frames.data(), sizeof(float), frames.size(), fp);
         fclose(fp);
       }
+      // 导出 fbank 实际收到的全部 PCM 样本 (int16), 与 wav 原始数据对比
+      {
+        std::lock_guard<std::mutex> lk(stream_mu_);
+        FILE* fp2 = fopen("/data/local/tmp/npu/calib/pcm_all.bin", "wb");
+        if (fp2) {
+          int32_t n = static_cast<int32_t>(mf_->SampleCount());
+          std::vector<int16_t> buf(n);
+          for (int32_t i = 0; i < n; ++i)
+            buf[i] = static_cast<int16_t>(mf_->SampleAt(i));
+          fwrite(buf.data(), sizeof(int16_t), buf.size(), fp2);
+          fclose(fp2);
+        }
+      }
     }
     if (getenv("SSUB_NPU_DEBUG")) {
       fprintf(stderr, "npu: ProcessChunk frames=%zu\n", frames.size() / 80);
@@ -318,18 +334,20 @@ class NpuBackend : public AsrBackend {
                 pre_cmvn_mean0, pre_cmvn_std0,
                 -model_->NegativeMean()[0], model_->InverseStdDev()[0]);
     }
+    // 处理顺序与 sherpa 参考管线
+    // (online-recognizer-paraformer-impl.h DecodeStream) 完全一致:
+    // 先只对 10 个新 LFR 帧做 CMVN/PE, 再前置 8 帧上下文。
+    // 缓存中的上下文帧已带其作为新帧时的 CMVN/PE, 而 PE 是加法叠加,
+    // 若拼缓存后再对整窗做 PE, 上下文会被二次叠加 PE 且位置偏移 8 帧,
+    // 编码器输出退化为"末帧 alpha=1.0"的边界态, CIF 积分永不触发, 无 token。
+    ApplyCMVN(&frames);
+    // PE 偏移使用递增前的帧数 (与 sherpa 一致)
+    PositionalEncoding(&frames, processed_before / model_->LfrWindowShift());
     // 左右文缓存: 首块补零, 之后与上一块尾部重叠
     if (feat_cache_.empty()) {
       feat_cache_.resize((kLeftChunkFrames + kRightChunkFrames) * feat_dim_, 0);
     }
-    // 与主机参考管线(tools/host_ref.py)完全一致的处理顺序:
-    // 拼缓存 -> 整窗 CMVN -> 整窗 PE -> 缓存更新。
-    // (只对当前帧归一化再拼缓存的旧实现会使编码器输出恒为
-    // "末帧 alpha=1.0"的边界态, 无 token 输出)
     frames.insert(frames.begin(), feat_cache_.begin(), feat_cache_.end());
-    ApplyCMVN(&frames);
-    // PE 偏移使用递增前的帧数 (与 sherpa 一致)
-    PositionalEncoding(&frames, processed_before / model_->LfrWindowShift());
     std::copy(frames.end() - feat_cache_.size(), frames.end(),
               feat_cache_.begin());
     if (getenv("SSUB_NPU_DEBUG")) {

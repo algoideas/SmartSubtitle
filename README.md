@@ -354,7 +354,7 @@ hdc shell aa start -a EntryAbility -b com.ohos.smartsubtitle
 | 路径 | 职责 |
 |---|---|
 | `core/include/subtitle/asr_backend.h` | 后端统一接口与结果模型（partial/final） |
-| `core/src/backends/cpu_backend.cc` | CPU 后端：sherpa-onnx 流式 Paraformer + Silero VAD 门控 + 规则断句 |
+| `core/src/backends/cpu_backend.cc` | CPU 后端：默认手动管线（与 NPU 后端同一条特征/解码路径：ManualFbank + ORT int8 编码器）；`SSUB_CPU_REF_PIPELINE=1` 切回 sherpa C API 参考管线（OnlineRecognizer + 端点检测 + VAD 门控） |
 | `core/src/backends/npu_backend.cc` | NPU 后端：RKNN 编码器推理 + CPU 贪心 CTC 解码 |
 | `core/cli/main.cc` | 独立 CLI：WAV/stdin/ALSA 麦克风三种输入 |
 | `entry/src/main/cpp/napi_init.cpp` | NAPI 桥接 + 线程安全回调（`napi_threadsafe_function`） |
@@ -386,7 +386,7 @@ AudioCapturer(16k/16bit/单声道)
   → napi_threadsafe_function → ArkTS onSubtitle → 字幕 UI（partial 灰色、final 白色）
 ```
 
-断句策略：sherpa-onnx 规则断句——句尾静音 ≥ 0.8 s 立即断句；起始静音场景放宽至 2.4 s；单句超过 20 s 强制断句（`OnlineRecognizerEndpointConfig`）。
+结果输出策略：默认手动管线以滚动 partial 输出完整累计文本（不做规则断句，整句随音频推进逐步补全）；参考管线（`SSUB_CPU_REF_PIPELINE=1`）使用 sherpa-onnx 规则断句——句尾静音 ≥ 0.8 s 立即断句；起始静音场景放宽至 2.4 s；单句超过 20 s 强制断句（`OnlineRecognizerEndpointConfig`）。
 
 ## 常见问题
 
@@ -395,9 +395,16 @@ AudioCapturer(16k/16bit/单声道)
 3. **NPU 后端 `rknn_run failed`**：确认 `.rknn` 模型转换时 `target_platform='rk3588'`，且板端 `librknnrt.so` 版本 ≥ 转换用 toolkit 版本。
 4. **延迟偏高**：CPU 后端可将 `num_threads` 调至 4–6；确认使用的是 int8 量化模型；RK3588 上优先切换 NPU 后端。
 5. **识别结果全为空**：检查采样率是否为 16 kHz、声道是否为单声道；VAD 门控在持续静音时会主动丢弃音频，属于预期行为。
-6. **NPU float 编码器输出损坏（alphas 恒定 0.357、enc 含 inf）**：rknn-toolkit2 v2.1.0 转出的 float 编码器在 RK3588 NPU 上不可用（48 帧与 18 帧转换均复现），HAP 内请使用 int8 量化版本。另注意 int8 版 RKNN 输出的 alphas 总和较 ORT 参考系统性偏大（约 6 倍，rknn_alpha_sum≈7.9 vs ort≈1.2），该缩放偏差是 NPU 识别文本重复乱码的疑似主因，后续可从 CIF 门控归一化或混合量化方向改进。
+6. **NPU float 编码器输出损坏（alphas 恒定 0.357、enc 含 inf）**：rknn-toolkit2 v2.1.0 转出的 float 编码器在 RK3588 NPU 上不可用（48 帧与 18 帧转换均复现），HAP 内请使用 int8 量化版本。另注意 int8 版 RKNN 输出的 alphas 总和较 ORT 参考系统性偏大（约 6 倍，rknn_alpha_sum≈7.9 vs ort≈1.2），该缩放偏差是 NPU 识别文本重复乱码的疑似主因，后续可从 CIF 门控归一化或混合量化方向改进。（2026-11-27 复核：修复第 9 条三个管线 bug 后，在**正确输入**下 float 版仍 alphas 恒 0.357 + enc 含 inf，int8 版仍乱码——此前 alphas 对比数据多在损坏输入上取得，结论需按干净输入重新评估，见第 9 条。）
 7. **rknn-toolkit2 v2.3.2 定向量化实验**：`config(custom_quantize_layers)` 在 v2.3.2 已移除；改用混合量化两步流程（`hybrid_quantization_step1` + 编辑 .quantization.cfg + `step2`）时，step2 对 ONNX 来源的 .model 文件反序列化失败（`_pickle.UnpacklingError`，疑似 v2.3.2 兼容问题），且 cfg 中仅 Sigmoid 层名可匹配到 alpha 分支。v2.3.2 + 新校准数据的 normal int8 重转后 alphas 仍散乱（块内总和 1.9-3.2 vs ORT 参考 ~1.2），文本仍为乱码。另实测 hardware_npu2 的 runtime/ohos/librknnrt.so.2.4.1 与当前部署库 md5 相同（65d7ffa），Linux aarch64 变体为 glibc 链接、OHOS musl 环境不可用。alpha 分支持换保真度问题仍待解决，转换脚本已支持 `--hybrid`/`--float-layers`/`--algorithm` 参数供后续版本验证。
 8. **rknn-toolkit2 v2.3.2 + mmse 量化实测无改善**：使用 v2.3.2 的 mmse 算法重转 int8 模型，其 alphas 逐帧输出与 v2.1.0 mmse 版完全一致（识别文本仍为 `</s></s></s>` 特殊 token），说明 alpha 分支的量化保真度问题与 toolkit 版本无关，需从转换图结构（如 CIF 门控归一化、混合精度量化）方向继续攻关。
+9. **2026-11-27 根因排查：三处管线 bug 修复（此前板卡 CLI 结果全部无效）**：板卡 CLI 长期"乱码/无文本"由三个叠加 bug 造成——
+    (a) CLI `LoadWav` 用 `istreambuf_iterator<char>` 把数据块**逐字节**值扩展为 int16 样本（样本数翻倍、值域 0..255），板卡 CLI 实际喂入的是字节级垃圾而非音频（dump 实测：缓冲 347300 样本 = 数据块字节数 321700 + 尾部静音 25600，首样本序列与 wav 数据块 LE 字节逐一吻合）；
+    (b) `npu_backend.cc` 的 `ApplyCMVN` 用 `(x + neg_mean)`，而 funasr 导出的 `neg_mean` 按"待减均值"约定，正确公式为 `(x - neg_mean) * inv_stddev`（与 vendored 参考 `online-recognizer-paraformer-impl.h` 一致）；
+    (c) 位置编码顺序：CMVN/位置编码应**只作用于 10 个新增 LFR 帧**，再前缀 8 帧左右文缓存（缓存帧沿用上一块的归一化结果，匹配参考 `DecodeStream` 装配顺序）；先对整窗 18 帧处理再截断会使特征整体偏移。
+    修复后上板验证：CLI 默认 CPU（手动管线）与 HAP 环境检查均输出完整文本"昨天是monday today is 礼拜二(零八二) the day after tomorrow 是星期三"，与主机 numpy 参考管线（`tools/host_ref2.py`）逐块一致；主机上 int8 与 float 的 ORT 编码器在相同特征下 alpha 几乎相同，int8 编码器文件本身无精度问题。
+    NPU 在干净输入下复核：int8 RKNN 仍乱码、float RKNN 仍 alphas 恒 0.357 + enc 含 inf（第 6 条），NPU 编码器问题与输入无关、仍在转换图/运行期方向攻关。
+    新增诊断工具：`tools/host_ref2.py`（与参考逐行一致的 numpy 管线，可输出逐块 alpha/文本）、`tools/host_ref_int8.py`（同特征 float/int8 ORT 编码器对照）、`tools/dump_feats.py`（导出主机特征块供与板卡 dump 对比）；`SSUB_NPU_DUMP_RAW=1` 现同时导出板卡 fbank 收到的全部 PCM（`pcm_all.bin`）用于输入级核对。
 
 ## 许可
 

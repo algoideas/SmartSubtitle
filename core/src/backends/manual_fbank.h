@@ -54,6 +54,8 @@ class ManualFbank {
 
   size_t SampleCount() const { return pcm_.size(); }
 
+  float SampleAt(int32_t i) const { return pcm_[i]; }
+
   // 当前可产出的完整 fbank 帧数
   int32_t AvailableFrames() const {
     return static_cast<int32_t>(pcm_.size()) >= FL_
