@@ -37,8 +37,8 @@ else()
 endif()
 
 # ===== RKNN runtime (NPU backend, RK3588) =====
-# 默认使用仓库内 third_party/rknn (头文件来自 RknnFacialRecognitionDemo,
-# librknnrt.so 取自 rknn-toolkit2 v2.1.0), 也可用环境变量 RKNPU_ROOT
+# 默认使用仓库内 third_party/rknn (rknn-toolkit2 v2.1.0 头文件与
+# librknnrt.so), 也可用环境变量 RKNPU_ROOT
 # 指向 rknpu2 运行时:
 #   $RKNPU_ROOT/include/rknn_api.h
 #   $RKNPU_ROOT/lib/librknnrt.so 或 $RKNPU_ROOT/lib/arm64-v8a/librknnrt.so
