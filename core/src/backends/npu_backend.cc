@@ -218,6 +218,7 @@ class NpuBackend : public AsrBackend {
     alpha_cache_.assign(1, 0.0f);
     states_.clear();
     utterance_.clear();
+    pending_cont_ = false;
   }
 
   std::string LastError() const override {
@@ -642,15 +643,56 @@ class NpuBackend : public AsrBackend {
     const int64_t* p_ids = decoder_out[1].GetTensorData<int64_t>();
     int64_t n_ids = decoder_out[1].GetTensorTypeAndShapeInfo().GetShape()[1];
 
+    // token→文本组装 (子词拼接 + 中英空格感知):
+    // tokens.txt 中以 "@@" 结尾的 token 是子词续接标记 (如 "mon@@" + "day"
+    // = "monday", "tom@@" + "or@@" + "row" = "tomorrow" 可链式续接): 去掉
+    // 标记后与后续 token 直接相连。空格规则: ASCII 字母/数字后接单词词首
+    // (英文词边界 "the day"、中英边界 "tomorrow 是") 补空格; 中文字符后接
+    // 拉丁词不补空格 ("是monday"); 中文字符之间不补; 中文标点 (，。！？；：)
+    // 前不补。跨 chunk 续接状态由 pending_cont_ 保持。
     std::string text;
+    const auto last_char = [&]() -> char {
+      if (!text.empty()) {
+        return text.back();
+      }
+      return utterance_.empty() ? '\0' : utterance_.back();
+    };
     for (int64_t i = 0; i < n_ids; ++i) {
       if (p_ids[i] == 0) {
         continue;
       }
       auto it = tokens_.find(static_cast<int32_t>(p_ids[i]));
-      if (it != tokens_.end()) {
-        text += it->second;
+      if (it == tokens_.end()) {
+        continue;
       }
+      std::string tok = it->second;
+      const bool ends_cont =
+          tok.size() >= 2 && tok.compare(tok.size() - 2, 2, "@@") == 0;
+      if (ends_cont) {
+        tok.erase(tok.size() - 2);
+      }
+      if (!pending_cont_ && !tok.empty()) {
+        const char lc = last_char();
+        const bool last_ascii_alnum =
+            (lc >= 'a' && lc <= 'z') || (lc >= 'A' && lc <= 'Z') ||
+            (lc >= '0' && lc <= '9');
+        if (last_ascii_alnum) {
+          const unsigned char* u =
+              reinterpret_cast<const unsigned char*>(tok.data());
+          // 中文标点 (，。！？；：) 位于 CJK 全角块与 CJK 符号块
+          const bool cjk_punct =
+              (u[0] == 0xEF && u[1] == 0xBC &&
+               (u[2] == 0x81 || u[2] == 0x8C || u[2] == 0x9A ||
+                u[2] == 0x9B || u[2] == 0x9F)) ||
+              (u[0] == 0xE3 && u[1] == 0x80 &&
+               (u[2] == 0x80 || u[2] == 0x82));
+          if (u[0] < 0x80 || !cjk_punct) {
+            text += ' ';
+          }
+        }
+      }
+      text += tok;
+      pending_cont_ = ends_cont;
     }
 
     if (getenv("SSUB_NPU_DEBUG")) {
@@ -814,6 +856,7 @@ class NpuBackend : public AsrBackend {
   std::vector<Ort::Value> states_;
 
   std::string utterance_;
+  bool pending_cont_ = false;
   std::string lastError_ = "ok";
   AsrCallback callback_;
 

@@ -103,3 +103,6 @@ check*_*.onnx
 encoder.onnx.sim.data
 encoder.onnx.sim.quantization.cfg
 tools/__pycache__/
+
+# Agent 会话状态(非项目代码)
+.atomcode/
