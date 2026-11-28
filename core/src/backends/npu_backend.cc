@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 
+#include "onnxruntime_cxx_api.h"
 #include "sherpa-onnx/csrc/online-model-config.h"
 #include "sherpa-onnx/csrc/online-paraformer-model.h"
 #include "sherpa-onnx/csrc/online-stream.h"
@@ -105,7 +106,18 @@ class NpuBackend : public AsrBackend {
                      config.modelDir;
         return false;
       }
-      rknn_set_core_mask(ctx_, RKNN_NPU_CORE_0);
+      // NPU 核掩码: 默认 core0; SSUB_NPU_CORE 覆盖 (0=auto 1/2/4 单核 7=全核)
+      static rknn_core_mask core_mask = [] {
+        const char* e = getenv("SSUB_NPU_CORE");
+        if (e != nullptr) {
+          return static_cast<rknn_core_mask>(atoi(e));
+        }
+        return RKNN_NPU_CORE_0;
+      }();
+      rknn_set_core_mask(ctx_, core_mask);
+      if (getenv("SSUB_NPU_DEBUG")) {
+        fprintf(stderr, "npu: core_mask=%d\n", static_cast<int>(core_mask));
+      }
 
       // 查询输入属性: 记录 fmt/size 供 rknn_inputs_set 使用
       rknn_tensor_attr in_attr;
@@ -138,8 +150,49 @@ class NpuBackend : public AsrBackend {
       }
       alpha_index_ = io_num.n_output - 1;
       if (getenv("SSUB_NPU_DEBUG")) {
-        fprintf(stderr, "npu: encoder outputs=%u alpha_index=%u\n",
-                io_num.n_output, alpha_index_);
+        fprintf(stderr, "npu: encoder in=%u out=%u alpha_index=%u\n",
+                io_num.n_input, io_num.n_output, alpha_index_);
+        for (uint32_t i = 0; i < io_num.n_input; ++i) {
+          rknn_tensor_attr a;
+          memset(&a, 0, sizeof(a));
+          a.index = i;
+          if (rknn_query(ctx_, RKNN_QUERY_INPUT_ATTR, &a, sizeof(a)) ==
+              RKNN_SUCC) {
+            fprintf(stderr, "npu: in[%u] name=%s dims=[", i, a.name);
+            for (uint32_t d = 0; d < a.n_dims; ++d)
+              fprintf(stderr, "%s%u", d ? "," : "", a.dims[d]);
+            fprintf(stderr, "] fmt=%u type=%u size=%u\n",
+                    a.fmt, a.type, a.size);
+          }
+        }
+        for (uint32_t i = 0; i < io_num.n_output; ++i) {
+          rknn_tensor_attr a;
+          memset(&a, 0, sizeof(a));
+          a.index = i;
+          if (rknn_query(ctx_, RKNN_QUERY_OUTPUT_ATTR, &a, sizeof(a)) ==
+              RKNN_SUCC) {
+            fprintf(stderr, "npu: out[%u] name=%s dims=[", i, a.name);
+            for (uint32_t d = 0; d < a.n_dims; ++d)
+              fprintf(stderr, "%s%u", d ? "," : "", a.dims[d]);
+            fprintf(stderr, "] fmt=%u type=%u size=%u\n",
+                    a.fmt, a.type, a.size);
+          }
+        }
+      }
+
+      // 4) 外置 CIF (float32, CPU ORT): RKNN 模型内量化后的 CIF 分支
+      //    alphas 保真度差 (板上实测比参考系统性偏高 1.3~5.3 倍, 乱码),
+      //    改用 encoder.onnx 提取的 cif.onnx 在 CPU 上计算 (主机逐位验证)。
+      //    缺 cif.onnx 时回退 RKNN 内置 alphas (旧行为)。
+      {
+        const std::string cif_path = config.modelDir + "/cif.onnx";
+        std::ifstream cif_f(cif_path);
+        if (cif_f.good()) {
+          Ort::SessionOptions so;
+          so.SetIntraOpNumThreads(1);
+          cif_sess_ = std::make_shared<Ort::Session>(cif_env_, cif_path.c_str(), so);
+          use_external_cif_ = true;
+        }
       }
     }
 
@@ -404,6 +457,10 @@ class NpuBackend : public AsrBackend {
       enc_copy.assign(ref_enc, ref_enc + num_frames * 512);
       alpha.assign(ref_alpha, ref_alpha + num_frames);
     } else {
+      if (getenv("SSUB_NPU_ZERO_INPUT")) {
+        // 诊断: 喂全零特征, 判定 RKNN 输出是否与输入无关
+        for (auto& v : frames) v = 0.0f;
+      }
       rknn_input in;
       memset(&in, 0, sizeof(in));
       in.index = 0;
@@ -413,7 +470,10 @@ class NpuBackend : public AsrBackend {
       in.fmt = RKNN_TENSOR_NCHW;
       in.size = frames.size() * sizeof(float);
       in.buf = frames.data();
-      in.pass_through = 0;
+      // 非图像/序列模型标准喂法: pass_through=1 跳过运行时预处理(未定义
+      // mean/std 时对输入无效), 数据直喂模型。量化模型保留 0, 由运行时做
+      // float→int8 量化。SSUB_NPU_PT=1 强制 pass_through。
+      in.pass_through = (getenv("SSUB_NPU_PT") != nullptr) ? 1u : 0u;
       if (rknn_inputs_set(ctx_, 1, &in) != RKNN_SUCC) {
         lastError_ = "rknn_inputs_set failed";
         return;
@@ -424,16 +484,20 @@ class NpuBackend : public AsrBackend {
         return;
       }
 
-      // 只请求 enc(0) 与 alphas(最后), 跳过 int64 的 enc_len
+      // 请求 enc(0); 未启用外置 CIF 时再取 alphas(最后); 跳过 int64 的 enc_len
+      const bool rknn_alpha = !use_external_cif_;
+      const uint32_t n_outs = rknn_alpha ? 2u : 1u;
       rknn_output outs[2];
       memset(outs, 0, sizeof(outs));
       outs[0].index = 0;
       outs[0].want_float = 1;
       outs[0].is_prealloc = 0;
-      outs[1].index = alpha_index_;
-      outs[1].want_float = 1;
-      outs[1].is_prealloc = 0;
-      if (rknn_outputs_get(ctx_, 2, outs, nullptr) != RKNN_SUCC) {
+      if (rknn_alpha) {
+        outs[1].index = alpha_index_;
+        outs[1].want_float = 1;
+        outs[1].is_prealloc = 0;
+      }
+      if (rknn_outputs_get(ctx_, n_outs, outs, nullptr) != RKNN_SUCC) {
         lastError_ = "rknn_outputs_get failed";
         fprintf(stderr, "npu: rknn_outputs_get failed\n");
         return;
@@ -441,13 +505,38 @@ class NpuBackend : public AsrBackend {
 
       const float* p_enc =
           reinterpret_cast<const float*>(outs[0].buf);  // [1, num_frames, 512]
-      const float* p_alpha =
-          reinterpret_cast<const float*>(outs[1].buf);  // [1, num_frames]
+      const float* p_alpha = rknn_alpha
+          ? reinterpret_cast<const float*>(outs[1].buf)  // [1, num_frames]
+          : nullptr;
 
       // 拷贝 enc 数据后立即释放 RKNN 输出缓冲, 避免悬垂引用
       enc_copy.assign(p_enc, p_enc + num_frames * 512);
-      alpha.assign(p_alpha, p_alpha + num_frames);
-      rknn_outputs_release(ctx_, 2, outs);
+      if (p_alpha != nullptr) {
+        alpha.assign(p_alpha, p_alpha + num_frames);
+      }
+      rknn_outputs_release(ctx_, n_outs, outs);
+
+      if (use_external_cif_) {
+        // 外置 CIF: alphas = cif.onnx(enc, speech_lengths), float32
+        // (tools/export_cif_subgraph.py, 与编码器内置 alphas 逐位一致)
+        auto mem =
+            Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
+        std::array<int64_t, 3> enc_shape{1, num_frames, 512};
+        Ort::Value enc_v = Ort::Value::CreateTensor(
+            mem, const_cast<float*>(enc_copy.data()), enc_copy.size(),
+            enc_shape.data(), 3);
+        int32_t len_val = num_frames;
+        std::array<int64_t, 1> len_shape{1};
+        Ort::Value len_v =
+            Ort::Value::CreateTensor(mem, &len_val, 1, len_shape.data(), 1);
+        Ort::Value cif_inputs[2] = {std::move(enc_v), std::move(len_v)};
+        const char* cif_in_names[] = {"enc", "speech_lengths"};
+        const char* cif_out_names[] = {"alphas"};
+        auto cif_out = cif_sess_->Run(Ort::RunOptions{}, cif_in_names,
+                                      cif_inputs, 2, cif_out_names, 1);
+        const float* p_cif = cif_out[0].GetTensorData<float>();
+        alpha.assign(p_cif, p_cif + num_frames);
+      }
     }
     const float* p_enc = enc_copy.data();
     int32_t enc_dim = 512;
@@ -584,13 +673,74 @@ class NpuBackend : public AsrBackend {
       auto ref = model_->ForwardEncoder(std::move(x), std::move(x_len_v));
       const float* ref_enc = ref[0].GetTensorData<float>();
       const float* ref_alpha = ref[2].GetTensorData<float>();
-      float enc_diff = 0, ref_enc_abs = 0, ref_alpha_sum = 0;
+      float enc_diff = 0, enc_diff_sum = 0, ref_enc_abs = 0;
+      float rknn_enc_abs = 0, ref_alpha_sum = 0;
       for (int32_t i = 0; i != num_frames * 512; ++i) {
-        enc_diff = std::max(enc_diff, std::fabs(ref_enc[i] - enc_copy[i]));
+        const float d = std::fabs(ref_enc[i] - enc_copy[i]);
+        enc_diff = std::max(enc_diff, d);
+        enc_diff_sum += d;
         ref_enc_abs += std::fabs(ref_enc[i]);
+        rknn_enc_abs += std::fabs(enc_copy[i]);
       }
       for (int32_t i = 0; i != num_frames; ++i) {
         ref_alpha_sum += ref_alpha[i];
+      }
+      // 结构签名: 恒等布局余弦相似度 + 逐帧量级剖面。若 RKNN enc 是
+      // ORT enc 的某种布局重排, 余弦/剖面会暴露特征; 若值本身错乱, 则均低
+      double dot = 0, na = 0, nb = 0;
+      for (int32_t i = 0; i != num_frames * 512; ++i) {
+        dot += (double)ref_enc[i] * enc_copy[i];
+        na += (double)ref_enc[i] * ref_enc[i];
+        nb += (double)enc_copy[i] * enc_copy[i];
+      }
+      float enc_cos = (na > 0 && nb > 0)
+                          ? static_cast<float>(dot / std::sqrt(na * nb))
+                          : -99.f;
+      float ofa[8] = {0}, rfa[8] = {0};
+      for (int32_t t = 0; t < num_frames; ++t) {
+        float so = 0, sr = 0;
+        for (int32_t c = 0; c < 512; ++c) {
+          so += std::fabs(ref_enc[t * 512 + c]);
+          sr += std::fabs(enc_copy[t * 512 + c]);
+        }
+        if (t < 6) {
+          ofa[t] = so;
+          rfa[t] = sr;
+        } else if (t == num_frames - 2) {
+          ofa[6] = so;
+          rfa[6] = sr;
+        } else if (t == num_frames - 1) {
+          ofa[7] = so;
+          rfa[7] = sr;
+        }
+      }
+      fprintf(stderr,
+              "npu ref: enc_cos=%.4f "
+              "ofa=[%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f] "
+              "rfa=[%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f]\n",
+              enc_cos, ofa[0], ofa[1], ofa[2], ofa[3], ofa[4], ofa[5], ofa[6],
+              ofa[7], rfa[0], rfa[1], rfa[2], rfa[3], rfa[4], rfa[5], rfa[6],
+              rfa[7]);
+      if (getenv("SSUB_NPU_DUMP_ENC")) {
+        static int enc_idx = 0;
+        if (enc_idx < 16) {
+          char p[200];
+          snprintf(p, sizeof(p),
+                   "/data/local/tmp/npu/probe/rknn_enc_%03d.bin", enc_idx);
+          FILE* fp = fopen(p, "wb");
+          if (fp) {
+            fwrite(enc_copy.data(), sizeof(float), enc_copy.size(), fp);
+            fclose(fp);
+          }
+          snprintf(p, sizeof(p),
+                   "/data/local/tmp/npu/probe/ort_enc_%03d.bin", enc_idx);
+          fp = fopen(p, "wb");
+          if (fp) {
+            fwrite(ref_enc, sizeof(float), num_frames * 512, fp);
+            fclose(fp);
+          }
+          enc_idx++;
+        }
       }
       if (getenv("SSUB_NPU_DEBUG")) {
         fprintf(stderr, "npu ref: ort_alpha vec=[");
@@ -601,8 +751,10 @@ class NpuBackend : public AsrBackend {
       }
       fprintf(stderr,
               "npu ref: ort_alpha_sum=%.3f rknn_alpha_sum=%.3f "
-              "enc_max_diff=%.4f ort_enc_abs_sum=%.1f\n",
-              ref_alpha_sum, alpha_sum, enc_diff, ref_enc_abs);
+              "enc_max_diff=%.4f enc_mean_diff=%.4f "
+              "ort_enc_abs=%.1f rknn_enc_abs=%.1f\n",
+              ref_alpha_sum, alpha_sum, enc_diff,
+              enc_diff_sum / (num_frames * 512), ref_enc_abs, rknn_enc_abs);
     }
 
     if (!text.empty()) {
@@ -649,6 +801,11 @@ class NpuBackend : public AsrBackend {
   uint32_t in_elems_ = 0;
   uint32_t alpha_index_ = 2;  // alphas 输出索引 (最后一个输出)
   bool use_ort_ = false;      // true: ORT 编码器 (CPU 模式)
+
+  // 外置 CIF: cif.onnx 在 CPU 上算 alphas (RKNN 内量化 CIF 保真度差)
+  Ort::Env cif_env_{ORT_LOGGING_LEVEL_WARNING, "ssub-cif"};
+  std::shared_ptr<Ort::Session> cif_sess_;
+  bool use_external_cif_ = false;
 
   int32_t num_processed_ = 0;
   std::vector<float> feat_cache_;

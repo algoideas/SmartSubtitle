@@ -96,3 +96,10 @@ entry/src/main/resources/rawfile/models/
 paraformer-encoder*.rknn
 *.sim.onnx
 calib_data/
+calib_clean/
+
+# NPU 调研中间产物(可由 tools/ 下脚本重新生成)
+check*_*.onnx
+encoder.onnx.sim.data
+encoder.onnx.sim.quantization.cfg
+tools/__pycache__/

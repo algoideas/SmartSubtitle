@@ -12,6 +12,7 @@
 - [环境准备](#环境准备)
 - [CPU 推理环境搭建（任意 aarch64 OpenHarmony）](#cpu-推理环境搭建)
 - [NPU 推理环境搭建（RK3588）](#npu-推理环境搭建rk3588)
+- [NPU 精度调研记录（RK3588）](#npu-精度调研记录rk3588)
 - [独立二进制（CLI）构建与运行](#独立二进制构建与运行)
 - [OpenHarmony 应用构建](#openharmony-应用构建)
 - [应用实现说明](#应用实现说明)
@@ -180,13 +181,13 @@ entry/src/main/cpp/third_party/sherpa-onnx/
 
 ### HAP 内 NPU 的线程模型要求
 
-HAP 应用进程内通过 JS Worker 线程加载 `librknnrt.so` 在部分 RK3588 板卡（如 Orange Pi 5B, OpenHarmony 6.1）上会触发系统 musl 动态链接器符号解析崩溃（WorkerThread `find_sym2` SIGSEGV，见 faultlogger）。
+HAP 应用进程内首次加载 `librknnrt.so`（即首次 dlopen `libentry.so` 发生在 JS Worker 线程内）在部分 RK3588 板卡（如 Orange Pi 5B, OpenHarmony 6.1）上会触发系统 musl 动态链接器符号解析崩溃（WorkerThread `find_sym2` SIGSEGV，见 faultlogger）。
 
-**解决方案**（已实现）：引擎完全在主线程驱动，Worker 架构已移除：
+**解决方案**（已实现）：构建期链接 + 主线程预加载：
 
-- `librknnrt.so` 采用构建期链接（DT_NEEDED），随 `libentry.so` 在主线程加载；
-- NPU 环境检查与实时推理均在主线程调用 `startEngine`/`feedAudio`/`stopEngine`；
-- CPU 后端同样走主线程路径，两后端行为一致。
+- `librknnrt.so` 采用构建期链接（DT_NEEDED），`EntryAbility` 在主线程预加载 `libentry.so`（连带拉起 `librknnrt.so`）；
+- 之后 Worker 线程（`SubtitleWorker`）调用 `startEngine`/`feedAudio`/`stopEngine` 不再触发新的 dlopen，规避 musl 崩溃；
+- CPU 后端不依赖 `librknnrt.so`，非 RK3588 设备上行为一致。
 
 注意：应用沙箱内目录（filesDir）与 `/data/local/tmp` 的运行时 dlopen 会被 OHOS 安全策略静默拒绝（返回 null），因此运行时 dlopen 方案不可行，必须使用构建期链接。
 
@@ -296,6 +297,107 @@ entry/src/main/cpp/third_party/rknpu/
 
 > NPU 后端初始化时通过 `rknn_set_core_mask` 绑定到 NPU 核 0（RK3588 三核 NPU，流式编码器单核即可，其余核留给相机/渲染等场景）。若需多路并发字幕，可在 `npu_backend.cc` 中扩展多实例并分核绑定。
 
+## NPU 精度调研记录（RK3588）
+
+2026-11-27 修复三处管线 bug（见常见问题第 9 条）后，CPU 后端上板验证通过（端到端输出
+完整双语文本），但 NPU int8 编码器仍输出乱码。2026-11-28 起进行了系统性调研，
+过程与证据链如下，最终定位根因。
+
+### 调研过程与证据链
+
+**(1) 输入依赖验证**（排除"固定输出"故障假设）
+向 float RKNN 编码器喂两种不同输入（全零特征 vs 真实特征），板卡输出随之变化——
+NPU 在真实执行计算图，问题在数值保真度，而非输出固定模式。
+
+**(2) 深度二分**（定位发散深度）
+用 `tools/make_trunc_model.py` 生成不同块数的截断编码器（目标 = 各块残差 Add 输出
+张量），转 int8 RKNN 后上板与主机 ORT 同深度输出逐帧对照（16 块音频 × 18 帧）：
+
+| 模型深度 | 逐帧 cos（板卡 vs ORT） | 幅值比 |
+|---|---|---|
+| 2 块 | 0.9947–0.9980 | 0.996–1.016（干净） |
+| 26 块 | 0.945–0.968 | 0.81–0.92（轻度） |
+| 32 块 | 0.796–0.979 | 0.65–0.87（中度） |
+| 39 块 | 0.16–0.99 | 0.6–12×（混乱） |
+| 50 块（全模型） | ~0.06 | ±127 饱和 |
+
+误差随深度加速累积、约 32 块后急剧发散——**不是单个坏块，而是残差流的数值
+不稳定性随深度放大**（softmax/深度放大效应）。
+
+**(3) 902 层 fp16 激活混合量化**（排除激活量化假设）
+用两步混合量化流程（`hybrid_quantization_step1` → 编辑 `.quantization.cfg` →
+`step2`）把主路径 902 个 int8 激活张量（除 CIF 分支与 SDPA 内部临时量）全部设为
+float16（权重仍 int8，模型 311MB）：板卡输出仍为 18 帧全部 ±127 饱和（每 chunk
+9216 个值仅 2 个唯一值，即 int8 反量化的 ±max）。**"激活 int8 量化误差"被排除
+为主因**——激活 fp16（激活量化误差为零）依然崩溃。
+
+**(4) int16（`w16a16i_dfp`，toolkit 2.5.0）**（int16 路径被拒）
+toolkit 2.5.0 支持 `quantized_dtype='w16a16i_dfp'`（int16 权重 + int16 激活）。
+标定阶段即被拒绝：
+`The 'min/max' of '/encoder/encoders/encoders.27/Add_1_output_0-rs' is too large for 'w16a16i_dfp'`
+——**模型第 27 块残差流的动态范围超出 int16 表示能力**（该检查基于 float 标定
+数据，是模型固有属性，与板卡/NPU 无关）。
+
+**(5) 纯 float（toolkit 2.3.2 与 2.5.0）**（fp16 溢出）
+`do_quantization=False` 构建：RK3588 NPU 无 fp32 执行路径，构建日志显示所有张量
+`type is set to float16 by default`——"float 模型"实为 fp16。板卡输出全 NaN
+（两块板、toolkit 2.3.2 与 2.5.0 均复现）。**fp16 在深层块同样溢出**。
+
+**(6) mmse 标定算法**（非主因，且不可行）
+v2.3.2 的 mmse 标定在本模型上病态慢（4 小时仅完成 28% 层组的 73%），且实验 (3)
+已证明激活量化误差清零也崩溃，标定算法不是主因。
+
+**(7) 跨板验证**（排除板卡/驱动个体差异）
+同一 int8 全模型在两块 RK3588 板（NPU 驱动均为 v0.9.8）上以相同模式失败
+（饱和帧位置随输入内容变化、乱码文本一致）——非特定固件/驱动问题。
+
+### 根因结论
+
+**50 块流式 Paraformer 编码器的激活（残差流 + 注意力/FFN 中间量）动态范围超出
+RK3588 NPU 任一支持数值格式（int8 / int16 / fp16）的表示能力：**
+
+- int8：深度依赖发散（证据 (2)）；
+- int16：第 27 块残差 min/max 超出表示范围，toolkit 拒绝构建（证据 (4)）；
+- fp16：深层块 NaN 溢出（证据 (5)）。
+
+这是**模型架构 ↔ 硬件的数值不兼容**，无法通过标定算法、混合量化、toolkit 版本
+或喂数方式修复。架构背景：流式 Paraformer 为 pre-norm 结构，残差流直到最终
+`after_norm` 才归一化，后段块残差逐元素幅值合法增长到 O(10²–10³)，远超定点
+与 fp16 的动态范围。
+
+### 当前交付状态
+
+- **HAP 默认 CPU 后端**：板卡端到端验证通过（环境检查按钮识别预制 0.wav，输出
+  完整双语文本"昨天是monday today is 礼拜二(零八二) the day after tomorrow 是
+  星期三"），任意 aarch64 设备均可正确运行；
+- **NPU 管线完整实现**（特征前端 / RKNN 推理 / 外部 CIF / 贪心 CTC 解码 /
+  双输出解析），经独立 CLI（`smartsubtitle_cli --backend npu`）可在板端使用；
+  对本 50 块模型，int8 RKNN 输出的 alphas 较 ORT 参考系统性偏大约 6×，CIF
+  静音阈值门控被该尺度带偏，故文本乱码（属上述数值不兼容的下游表现）；
+- RK3588 设备上应用内可选 NPU 后端（设置卡片切换），当前建议以 CPU 路径为准。
+
+### 可行替代（后续工作）
+
+1. **量化感知训练（QAT）**：以 QAT 训练 int8 友好的 Paraformer 变体，从源头压缩
+   激活动态范围——最有希望，但需训练管线与数据；
+2. **动态范围更小的模型**：更浅的编码器（如 6–12 块 conformer 流式 ASR）可直接
+   复用现有 NPU 管线（仅需替换模型转换）；
+3. **更新工具链/硬件**：后续 RKNN 版本若支持更大数值范围或逐层混合 int16，可
+   用 `tools/rknn_experiment.py --dtype` 复测；
+4. **NPU 浅块 + CPU 深块混合切分**（未采用）：浅块（≤~26 块，已验证干净）走
+   NPU、深块走 CPU ORT，技术可行但引入跨设备数据交接复杂度，且不改变端到端
+   时延优势，未采用。
+
+### 调研工具（tools/）
+
+| 工具 | 用途 |
+|---|---|
+| `tools/rknn_experiment.py` | RKNN A/B 转换：`--no-hybrid` / `--no-flash` / `--algo normal/mmse/kld` / `--dtype w8a8/w8a16/w16a16i_dfp/w4a16` / `--float` / `--onnx` |
+| `tools/make_trunc_model.py` | 生成 N 块截断编码器（目标张量为任意残差节点输出）+ ORT 自洽校验 |
+| `tools/hybrid_fp16.py` | 两步混合量化（step1 → 幂等 cfg 编辑 → step2，支持 .model/.data 复用） |
+| `tools/hybrid_bigset.py` | 大批量 fp16 混合（自动剔除 CIF/SDPA 内部临时量） |
+| `tools/gen_calib.py` | 由真实音频生成流式编码器校准特征集（`calib_clean/`，606 样本） |
+
 ## 独立二进制构建与运行
 
 `core/` 目录不依赖 OpenHarmony，可编译出独立可执行文件 `smartsubtitle_cli`，用于在任何 aarch64 Linux/OpenHarmony 系统（包括 RK3588 开发板的终端）上直接验证识别管线。
@@ -395,7 +497,9 @@ AudioCapturer(16k/16bit/单声道)
 3. **NPU 后端 `rknn_run failed`**：确认 `.rknn` 模型转换时 `target_platform='rk3588'`，且板端 `librknnrt.so` 版本 ≥ 转换用 toolkit 版本。
 4. **延迟偏高**：CPU 后端可将 `num_threads` 调至 4–6；确认使用的是 int8 量化模型；RK3588 上优先切换 NPU 后端。
 5. **识别结果全为空**：检查采样率是否为 16 kHz、声道是否为单声道；VAD 门控在持续静音时会主动丢弃音频，属于预期行为。
-6. **NPU float 编码器输出损坏（alphas 恒定 0.357、enc 含 inf）**：rknn-toolkit2 v2.1.0 转出的 float 编码器在 RK3588 NPU 上不可用（48 帧与 18 帧转换均复现），HAP 内请使用 int8 量化版本。另注意 int8 版 RKNN 输出的 alphas 总和较 ORT 参考系统性偏大（约 6 倍，rknn_alpha_sum≈7.9 vs ort≈1.2），该缩放偏差是 NPU 识别文本重复乱码的疑似主因，后续可从 CIF 门控归一化或混合量化方向改进。（2026-11-27 复核：修复第 9 条三个管线 bug 后，在**正确输入**下 float 版仍 alphas 恒 0.357 + enc 含 inf，int8 版仍乱码——此前 alphas 对比数据多在损坏输入上取得，结论需按干净输入重新评估，见第 9 条。）
+6. **NPU float 编码器输出损坏（alphas 恒定 0.357、enc 含 inf）**：rknn-toolkit2 v2.1.0 转出的 float 编码器在 RK3588 NPU 上不可用（48 帧与 18 帧转换均复现），HAP 内请使用 int8 量化版本。另注意 int8 版 RKNN 输出的 alphas 总和较 ORT 参考系统性偏大（约 6 倍，rknn_alpha_sum≈7.9 vs ort≈1.2），该缩放偏差是 NPU 识别文本重复乱码的疑似主因。2026-11-28 定论：该偏差是深度块
+数值发散（残差流动态范围超出 NPU 数值格式表示能力）的下游表现，见「NPU 精度
+调研记录」章节。（2026-11-27 复核：修复第 9 条三个管线 bug 后，在**正确输入**下 float 版仍 alphas 恒 0.357 + enc 含 inf，int8 版仍乱码——此前 alphas 对比数据多在损坏输入上取得，结论需按干净输入重新评估，见第 9 条。）
 7. **rknn-toolkit2 v2.3.2 定向量化实验**：`config(custom_quantize_layers)` 在 v2.3.2 已移除；改用混合量化两步流程（`hybrid_quantization_step1` + 编辑 .quantization.cfg + `step2`）时，step2 对 ONNX 来源的 .model 文件反序列化失败（`_pickle.UnpacklingError`，疑似 v2.3.2 兼容问题），且 cfg 中仅 Sigmoid 层名可匹配到 alpha 分支。v2.3.2 + 新校准数据的 normal int8 重转后 alphas 仍散乱（块内总和 1.9-3.2 vs ORT 参考 ~1.2），文本仍为乱码。另实测 hardware_npu2 的 runtime/ohos/librknnrt.so.2.4.1 与当前部署库 md5 相同（65d7ffa），Linux aarch64 变体为 glibc 链接、OHOS musl 环境不可用。alpha 分支持换保真度问题仍待解决，转换脚本已支持 `--hybrid`/`--float-layers`/`--algorithm` 参数供后续版本验证。
 8. **rknn-toolkit2 v2.3.2 + mmse 量化实测无改善**：使用 v2.3.2 的 mmse 算法重转 int8 模型，其 alphas 逐帧输出与 v2.1.0 mmse 版完全一致（识别文本仍为 `</s></s></s>` 特殊 token），说明 alpha 分支的量化保真度问题与 toolkit 版本无关，需从转换图结构（如 CIF 门控归一化、混合精度量化）方向继续攻关。
 9. **2026-11-27 根因排查：三处管线 bug 修复（此前板卡 CLI 结果全部无效）**：板卡 CLI 长期"乱码/无文本"由三个叠加 bug 造成——
@@ -404,6 +508,7 @@ AudioCapturer(16k/16bit/单声道)
     (c) 位置编码顺序：CMVN/位置编码应**只作用于 10 个新增 LFR 帧**，再前缀 8 帧左右文缓存（缓存帧沿用上一块的归一化结果，匹配参考 `DecodeStream` 装配顺序）；先对整窗 18 帧处理再截断会使特征整体偏移。
     修复后上板验证：CLI 默认 CPU（手动管线）与 HAP 环境检查均输出完整文本"昨天是monday today is 礼拜二(零八二) the day after tomorrow 是星期三"，与主机 numpy 参考管线（`tools/host_ref2.py`）逐块一致；主机上 int8 与 float 的 ORT 编码器在相同特征下 alpha 几乎相同，int8 编码器文件本身无精度问题。
     NPU 在干净输入下复核：int8 RKNN 仍乱码、float RKNN 仍 alphas 恒 0.357 + enc 含 inf（第 6 条），NPU 编码器问题与输入无关、仍在转换图/运行期方向攻关。
+    2026-11-28 调研完结：根因确认为 RK3588 NPU 数值范围（int8/int16/fp16）不足以承载该 50 块模型激活，完整证据链见「NPU 精度调研记录」章节；交付以 CPU 后端为主路径。
     新增诊断工具：`tools/host_ref2.py`（与参考逐行一致的 numpy 管线，可输出逐块 alpha/文本）、`tools/host_ref_int8.py`（同特征 float/int8 ORT 编码器对照）、`tools/dump_feats.py`（导出主机特征块供与板卡 dump 对比）；`SSUB_NPU_DUMP_RAW=1` 现同时导出板卡 fbank 收到的全部 PCM（`pcm_all.bin`）用于输入级核对。
 
 ## 许可
