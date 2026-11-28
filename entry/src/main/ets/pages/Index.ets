@@ -53,6 +53,15 @@ struct Index {
       // update the in-flight partial caption
       list[list.length - 1].text = text;
       list[list.length - 1].time = stamp;
+    } else if (isFinal && list.length > 0 &&
+               !list[list.length - 1].isFinal &&
+               (text === list[list.length - 1].text ||
+                text.startsWith(list[list.length - 1].text))) {
+      // 停止排空的最终文本是最后一条 partial 的延伸 (含 tsfn 队列丢失的
+      // 句尾), 就地替换定稿, 避免重复行
+      list[list.length - 1].text = text;
+      list[list.length - 1].isFinal = true;
+      list[list.length - 1].time = stamp;
     } else {
       list.push({ text: text, isFinal: isFinal, time: stamp });
       // keep the visible history bounded

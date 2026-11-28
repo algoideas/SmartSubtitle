@@ -13,7 +13,8 @@ export function startEngine(backend: string, modelDir: string,
   callback: (text: string, isFinal: boolean) => void): boolean;
 
 /** Stop the engine and release native resources. */
-export function stopEngine(): void;
+// 同步排空尾部并返回最终完整文本(无则空串)
+export function stopEngine(): string;
 
 /**
  * Feed 16 kHz mono signed-16-bit PCM captured from the microphone.

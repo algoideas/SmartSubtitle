@@ -115,14 +115,23 @@ napi_value StartEngine(napi_env env, napi_callback_info info)
 
 napi_value StopEngine(napi_env env, napi_callback_info /*info*/)
 {
-    g_engine.backend.reset();
+    // 最终文本经同步 Finalize/FinalText 获取并作为返回值传回 JS:
+    // 末段 partial 若依赖 tsfn 队列, 在 JS 线程释放 tsfn 时仍阻塞在本
+    // 调用内, 未投递的最终结果会随 tsfn 终结丢失 (板卡环境检查实测
+    // 丢失句尾)。
+    std::string finalText;
+    if (g_engine.backend != nullptr) {
+        g_engine.backend->Finalize();
+        finalText = g_engine.backend->FinalText();
+        g_engine.backend.reset();
+    }
     if (g_engine.tsfn != nullptr) {
         napi_release_threadsafe_function(g_engine.tsfn, napi_tsfn_release);
         g_engine.tsfn = nullptr;
     }
-    napi_value undefined;
-    napi_get_undefined(env, &undefined);
-    return undefined;
+    napi_value result;
+    napi_create_string_utf8(env, finalText.c_str(), finalText.size(), &result);
+    return result;
 }
 
 napi_value FeedAudio(napi_env env, napi_callback_info info)

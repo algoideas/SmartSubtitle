@@ -45,6 +45,15 @@ public:
 
     // Human readable last-error string for diagnostics / UI display.
     virtual std::string LastError() const = 0;
+
+    // Synchronously drain pending tail audio (injecting silence as needed)
+    // and stop the decode thread. Idempotent; the destructor still drains for
+    // callers that never call this (e.g. the standalone CLI).
+    virtual void Finalize() {}
+
+    // Complete accumulated text after Finalize(). Empty for backends that do
+    // not track a running utterance.
+    virtual std::string FinalText() const { return std::string(); }
 };
 
 // Factory: creates the requested backend. Never returns nullptr; a stub

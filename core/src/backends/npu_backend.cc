@@ -226,7 +226,17 @@ class NpuBackend : public AsrBackend {
     return lastError_;
   }
 
-  ~NpuBackend() {
+  // 同步排空尾部: 注入静音 + 等待 DecodeLoop 处理完积压帧 + 停止解码线程。
+  // 同步语义保证返回时 utterance_ 已完整 (FinalText 可安全读取)。
+  // HAP 停止路径 (NAPI StopEngine) 必须先走这里: 末段 partial 若只经
+  // threadsafe-function 队列投递, 在 JS 线程释放 tsfn 时它仍阻塞在停止
+  // 调用内, 队列中未投递的最终结果会随 tsfn 终结而丢失 (板卡环境检查
+  // 实测丢失句尾, 如"是星期三"只剩"是星期")。
+  void Finalize() override {
+    if (finalized_) {
+      return;
+    }
+    finalized_ = true;
     // 尾部注入 ~0.4s 静音: 音频结束时剩余帧不足 LFR 堆叠窗口(7 帧),
     // 滞留缓存永不编码, 末段 token(如"是星期三")会丢失; 注入静音补齐
     // 窗口使尾部得以编码输出
@@ -254,6 +264,15 @@ class NpuBackend : public AsrBackend {
     if (worker_.joinable()) {
       worker_.join();
     }
+  }
+
+  std::string FinalText() const override {
+    // 仅在 Finalize() 之后调用 (解码线程已 join, 无并发写)
+    return utterance_;
+  }
+
+  ~NpuBackend() {
+    Finalize();
     if (ctx_) {
       rknn_destroy(ctx_);
       ctx_ = 0;
@@ -863,6 +882,7 @@ class NpuBackend : public AsrBackend {
   mutable std::mutex stream_mu_;
   std::thread worker_;
   std::atomic<bool> running_{false};
+  bool finalized_ = false;
 };
 
 }  // namespace

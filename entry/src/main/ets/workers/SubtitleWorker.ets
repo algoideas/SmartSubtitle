@@ -39,9 +39,14 @@ function feedWavAndStop(buffer: ArrayBuffer): void {
   const timer = setInterval(() => {
     if (off >= dataOff + dataLen) {
       clearInterval(timer);
-      // 喂完后排水 2 秒, 让引擎完成断句再停止
+      // 喂完后排水 2 秒, 让引擎完成断句再停止; 最终文本由 stopEngine
+      // 同步返回并作为最终结果补发 (tsfn 队列的末段 partial 会随 tsfn
+      // 终结丢失, 不能依赖)
       setTimeout(() => {
-        stopEngine();
+        const finalText: string = stopEngine();
+        if (finalText.length > 0) {
+          workerPort.postMessage({ type: 'result', text: finalText, isFinal: true });
+        }
         workerPort.postMessage({ type: 'envcheck-done', ok: true, error: '' });
       }, 2000);
       return;
@@ -71,7 +76,12 @@ workerPort.onmessage = (e: MessageEvents) => {
   }
 
   if (type === 'stop') {
-    stopEngine();
+    // stopEngine 同步排空尾部并返回最终完整文本 (末段 partial 依赖
+    // tsfn 队列会在 tsfn 终结时丢失), 作为最终结果补发
+    const finalText: string = stopEngine();
+    if (finalText.length > 0) {
+      workerPort.postMessage({ type: 'result', text: finalText, isFinal: true });
+    }
     workerPort.postMessage({ type: 'stopped' });
     return;
   }
