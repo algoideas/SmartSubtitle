@@ -13,6 +13,7 @@
 - [CPU 推理环境搭建（任意 aarch64 OpenHarmony）](#cpu-推理环境搭建)
 - [NPU 推理环境搭建（RK3588）](#npu-推理环境搭建rk3588)
 - [NPU 精度调研记录（RK3588）](#npu-精度调研记录rk3588)
+- [NPU 拼接路线（NPU 浅层 + CPU 深层）](#npu-拼接路线npu-浅层--cpu-深层)
 - [独立二进制（CLI）构建与运行](#独立二进制构建与运行)
 - [OpenHarmony 应用构建](#openharmony-应用构建)
 - [应用实现说明](#应用实现说明)
@@ -242,17 +243,30 @@ python3 third_party/rknn/convert_paraformer_encoder.py \
 
 ### 3. NPU 推理管线（core/src/backends/npu_backend.cc）
 
-NPU 后端与 sherpa-onnx 的流式 Paraformer 识别管线逐层对齐：
+NPU 后端与 sherpa-onnx 的流式 Paraformer 识别管线逐层对齐。2026-11-28 起默认走
+**拼接路线**（NPU 浅层 + CPU 深层，见下节）：
 
 ```
 16k int16 PCM → fbank(80) → LFR 7 帧堆叠(560) → CMVN(模型元数据) →
-位置编码 → 左右文缓存(5+3 帧) → [1,18,560] → RKNN 编码器(NPU) →
-enc [1,18,512] + alphas → CIF 静音阈值搜索 → 声学嵌入 →
-解码器 CTC(ONNX, CPU) → token id → 文本
+位置编码 → 左右文缓存(5+3 帧) → [1,18,560] →
+  ① RKNN 前段 (NPU, 块 0–25, w8a8, paraformer-encoder-front.rknn) →
+     块 25 残差 [1,18,512]（fp32 精确交接, 无量化边界）→
+  ② ORT 尾部 (CPU, 块 26–49 + after_norm + 末端长度相关步骤,
+     paraformer-encoder-tail.onnx, int8, 输入 mid + speech_lengths) →
+     enc [1,18,512] →
+外置 CIF (cif.onnx, CPU) → alphas → CIF 静音阈值搜索 → 声学嵌入 →
+解码器 CTC (decoder.int8.onnx, CPU) → token id → 文本
 ```
 
-- 编码器跑在 NPU（int8 量化 `.rknn`），解码器 CTC 在 CPU（ORT +
-  `decoder.int8.onnx`），CMVN/LFR/位置编码参数均从编码器模型元数据读取；
+- 模型目录同时存在 `paraformer-encoder-front.rknn` 与
+  `paraformer-encoder-tail.onnx` 时自动进入拼接模式（`SSUB_NPU_DEBUG=1`
+  可见 `npu: mode=split(front+tail)`）；缺失任一则回退全量
+  `paraformer-encoder.rknn` 单模型（50 块全模型在 RK3588 上因数值不兼容
+  文本乱码，见精度调研记录——生产环境应使用拼接路线）；
+- 前段只有 1 个输出（无 alphas），拼接模式必须配 `cif.onnx` 外置计算
+  alphas；
+- 解码器 CTC 在 CPU（ORT + `decoder.int8.onnx`），CMVN/LFR/位置编码参数
+  均从前段 RKNN 模型元数据读取；
 - 解码器的长度输入为 **int32**（`enc_len`/`acoustic_embeds_len`），
   状态缓存 `in_cache_0..15` 形状 `[1,512,10]`，逐块传递。
 
@@ -268,18 +282,23 @@ entry/src/main/cpp/third_party/rknn/   # 构建时 entry 侧使用的副本
 entry/libs/arm64-v8a/librknnrt.so      # 打包进 HAP 的运行时库
 ```
 
-NPU 编码器模型 `paraformer-encoder.rknn`（int8 量化, ~171MB）随 HAP
-一起打包（置于 `entry/src/main/resources/rawfile/models/`），应用启动
-后由 `copyModelsToSandbox` 自动拷贝到沙箱，无需手工部署。注意：float
-版本在部分板卡 NPU 上推理输出异常（alphas 恒定、enc 含 inf），HAP 内
-请使用 int8 版本；该二进制体积过大不入仓库，构建前需按第 3 节完成
-RKNN 转换（int8 量化）后复制到该目录。
+NPU 拼接路线模型 `paraformer-encoder-front.rknn`（前段, 26 块 w8a8,
+~88MB）与 `paraformer-encoder-tail.onnx`（尾部, int8, ~74MB）置于
+`third_party/models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/`：
+尾部与 `cif.onnx` 已入库；`*.rknn` 体积过大不入库（构建前需按第 2 节
+完成 RKNN 转换后放入该目录），`build-hap.sh` 存在即拷贝到
+`entry/src/main/resources/rawfile/models/` 并随 HAP 打包，应用启动后由
+`copyModelsToSandbox` 自动拷贝到沙箱，无需手工部署。模型生成与切换
+深度见 [NPU 拼接路线](#npu-拼接路线npu-浅层--cpu-深层) 一节。
 
-模型文件部署到 RK3588 板端（OpenHarmony）：
+独立 CLI 的模型文件部署到 RK3588 板端（OpenHarmony）：
 
 ```bash
 hdc shell mkdir -p /data/local/tmp/smartsubtitle/models
-hdc file send paraformer-encoder.rknn /data/local/tmp/smartsubtitle/models/
+M=third_party/models/sherpa-onnx-streaming-paraformer-bilingual-zh-en
+hdc file send $M/paraformer-encoder-front.rknn /data/local/tmp/smartsubtitle/models/
+hdc file send $M/paraformer-encoder-tail.onnx /data/local/tmp/smartsubtitle/models/
+hdc file send $M/cif.onnx /data/local/tmp/smartsubtitle/models/
 # Silero VAD 与 tokens.txt 与 CPU 后端共用
 hdc file send ~/smartsubtitle-work/silero_vad.onnx /data/local/tmp/smartsubtitle/models/
 ```
@@ -370,11 +389,12 @@ RK3588 NPU 任一支持数值格式（int8 / int16 / fp16）的表示能力：**
 - **HAP 默认 CPU 后端**：板卡端到端验证通过（环境检查按钮识别预制 0.wav，输出
   完整双语文本"昨天是monday today is 礼拜二(零八二) the day after tomorrow 是
   星期三"），任意 aarch64 设备均可正确运行；
-- **NPU 管线完整实现**（特征前端 / RKNN 推理 / 外部 CIF / 贪心 CTC 解码 /
-  双输出解析），经独立 CLI（`smartsubtitle_cli --backend npu`）可在板端使用；
-  对本 50 块模型，int8 RKNN 输出的 alphas 较 ORT 参考系统性偏大约 6×，CIF
-  静音阈值门控被该尺度带偏，故文本乱码（属上述数值不兼容的下游表现）；
-- RK3588 设备上应用内可选 NPU 后端（设置卡片切换），当前建议以 CPU 路径为准。
+- **NPU 拼接路线已交付**（2026-11-28）：26 块前段（NPU w8a8）+ 24 块尾部
+  （CPU ORT int8）+ 外置 CIF + 解码器，板卡 CLI 与 HAP 环境检查验证通过，
+  文本质量与 CPU int8 路径同级（详见 [NPU 拼接路线](#npu-拼接路线npu-浅层--cpu-深层)）；
+- 50 块全模型 NPU 路线保留为代码回退（front+tail 缺失时自动使用
+  `paraformer-encoder.rknn`），因上述数值不兼容文本乱码，HAP 不再打包
+  全量模型。
 
 ### 可行替代（后续工作）
 
@@ -384,9 +404,9 @@ RK3588 NPU 任一支持数值格式（int8 / int16 / fp16）的表示能力：**
    复用现有 NPU 管线（仅需替换模型转换）；
 3. **更新工具链/硬件**：后续 RKNN 版本若支持更大数值范围或逐层混合 int16，可
    用 `tools/rknn_experiment.py --dtype` 复测；
-4. **NPU 浅块 + CPU 深块混合切分**（未采用）：浅块（≤~26 块，已验证干净）走
-   NPU、深块走 CPU ORT，技术可行但引入跨设备数据交接复杂度，且不改变端到端
-   时延优势，未采用。
+4. ~~**NPU 浅块 + CPU 深块混合切分**~~ → **已实现**，见
+   [NPU 拼接路线](#npu-拼接路线npu-浅层--cpu-深层)（2026-11-28 交付，
+   板卡验证通过）。
 
 ### 调研工具（tools/）
 
@@ -397,6 +417,67 @@ RK3588 NPU 任一支持数值格式（int8 / int16 / fp16）的表示能力：**
 | `tools/hybrid_fp16.py` | 两步混合量化（step1 → 幂等 cfg 编辑 → step2，支持 .model/.data 复用） |
 | `tools/hybrid_bigset.py` | 大批量 fp16 混合（自动剔除 CIF/SDPA 内部临时量） |
 | `tools/gen_calib.py` | 由真实音频生成流式编码器校准特征集（`calib_clean/`，606 样本） |
+| `tools/make_tail_model.py` | 从编码器截取"尾部"子图（块 N 之后的后缀图；默认源 encoder.int8.onnx；输入固定 `mid`+`speech_lengths`，输出 `enc`）+ ORT 全图一致性自校验——拼接路线用 |
+| `tools/export_cif_subgraph.py` | 从 encoder.onnx 提取 CIF 分支为独立 `cif.onnx`（输入 enc+speech_lengths，输出 alphas，与内置 alphas 逐位一致） |
+
+## NPU 拼接路线（NPU 浅层 + CPU 深层）
+
+2026-11-28 交付。基于深度二分证据（26 块干净、32 块后发散，见上节），把 50 块
+编码器在块 25 残差处一分为二：
+
+```
+[1,18,560] ──► RKNN 前段 (块 0–25, w8a8, NPU) ──fp32──► ORT 尾部 (块 26–49, int8, CPU)
+                                                             │
+                                                  enc [1,18,512]
+                                                             │
+                              cif.onnx (CPU) → alphas → CIF 阈值 → 解码器 int8 (CPU) → 文本
+```
+
+**为什么有效**：前 26 块内残差流动态范围尚在 w8a8 表示能力内（逐帧 cos
+0.945–0.968 vs ORT，轻度）；尾部 int8 与 CPU 路径已验证的
+`encoder.int8.onnx` 同源，同一输入下与全模型输出位精确一致（主机 ORT
+校验 `tail(front) == full`，max|diff| = 0.0）。交接点是精确 fp32 张量
+（无量化边界），端到端误差由前段 NPU int8 误差主导——与 CPU int8 全量路径
+属同一误差类，文本质量同级。
+
+**模型文件**（`third_party/models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/`）：
+
+| 文件 | 生成方法 | 体积 | 入库 |
+|---|---|---|---|
+| `paraformer-encoder-front.rknn` | `make_trunc_model.py`（26 块，目标 `/encoder/encoders/encoders.24/Add_1_output_0`）→ `rknn_experiment.py` w8a8 转换 | ~88MB | 否（*.rknn gitignore） |
+| `paraformer-encoder-tail.onnx` | `make_tail_model.py`（从 encoder.int8.onnx 截取后缀图；输入 `mid`[1,18,512] + `speech_lengths`[1] int32，输出 `enc`） | ~74MB | 是 |
+| `cif.onnx` | `export_cif_subgraph.py`（缺省时 `build-hap.sh` 现场生成） | ~3MB | 是 |
+
+**板卡验证**（2026-11-28，0.wav，`smartsubtitle_cli --backend npu`，
+`npu: mode=split(front+tail)`）：输出"昨天是monday today 礼拜二对after
+tomorrow 是星期三"，对照 CPU int8 全量路径"昨天是monday today is 零八二the
+day after tomorrow 是星期三"（正确文本：昨天是monday today is 礼拜二 the day
+after tomorrow 是星期三）——两者同为 int8 级词级误差，拼接路线反而正确识别
+"礼拜二"（CPU int8 误为"零八二"）。结论：**26 块深度成立，无需回退更浅切点**。
+
+**C++ 实现**（`core/src/backends/npu_backend.cc`）：
+
+- 自动检测：模型目录同时存在 front+tail → 拼接模式；否则回退全量
+  `paraformer-encoder.rknn`；
+- 拼接模式要求 `cif.onnx`（前段无 alphas 输出）；
+- 每块执行：RKNN 前段 → fp32 交接 → ORT 尾部（喂 `mid` +
+  `speech_lengths`=18）→ 外置 CIF → 解码器；
+- **坑（已踩过）**：CLI 静态链接的 ORT 在 aarch64 板端，
+  `OrtGetInputNameAllocated` C API 为坏调用——Session 构造成功后调用即跳未映射
+  地址（SEGV_MAPERR，进程退出码 139）；同一模型走硬编码输入名的外置 CIF
+  路径不受影响。故 NPU 后端全部输入名硬编码，尾部输入名由
+  `make_tail_model.py` 固定为 `mid` / `speech_lengths`；请勿使用
+  `Get*NameAllocated` API。
+
+**切点切换**：若文本退化需回退更浅切点（如 12 块），用 `make_trunc_model.py`
+（目标 `/encoder/encoders/encoders.11/Add_1_output_0`）重生成前段并
+`rknn_experiment.py` 转 `.rknn`，再用 `make_tail_model.py` 同目标张量重生成
+尾部——C++ 侧零改动（输入名与形状由约定固定）。
+
+**HAP 打包**：front + tail 替换原 171MB 全量 `paraformer-encoder.rknn`
+（HAP 体积 437MB → 412MB）；`build-hap.sh` 从 `third_party/models/` 自动
+拷贝（front.rknn 缺失时跳过并提示按第 2 节转换），
+`copyModelsToSandbox`（`entry/src/main/ets/pages/Index.ets`）负责沙箱拷贝。
 
 ## 独立二进制构建与运行
 

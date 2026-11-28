@@ -129,7 +129,14 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
     RAWFILE_MODELS="$PROJECT_DIR/entry/src/main/resources/rawfile/models"
     mkdir -p "$RAWFILE_MODELS"
     MODEL_SRC="$PROJECT_DIR/third_party/models/sherpa-onnx-streaming-paraformer-bilingual-zh-en"
-    for f in encoder.int8.onnx decoder.int8.onnx tokens.txt; do
+    # NPU 外置 CIF 模型: 缺失时由工具从 encoder.onnx 现场生成 (输入/输出与
+    # 编码器内置 alphas 逐位一致, 见 tools/validate_cif.py)
+    if [[ ! -f "$MODEL_SRC/cif.onnx" ]]; then
+        python3 "$PROJECT_DIR/tools/export_cif_subgraph.py" \
+            "$MODEL_SRC/encoder.onnx" "$MODEL_SRC/cif.onnx"
+    fi
+    for f in encoder.int8.onnx decoder.int8.onnx tokens.txt cif.onnx \
+             paraformer-encoder-front.rknn paraformer-encoder-tail.onnx; do
         if [[ -f "$MODEL_SRC/$f" ]]; then
             cp "$MODEL_SRC/$f" "$RAWFILE_MODELS/"
         fi

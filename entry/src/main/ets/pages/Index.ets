@@ -94,7 +94,8 @@ struct Index {
     if (!fs.accessSync(modelDir)) {
       fs.mkdirSync(modelDir, true);
     }
-    const names = ['encoder.int8.onnx', 'decoder.int8.onnx', 'tokens.txt', 'silero_vad.onnx', 'paraformer-encoder.rknn', 'cif.onnx'];
+    // NPU 拼接路线: 前段 RKNN (浅层 w8a8) + 尾部 ORT (深层 int8), 见 README NPU 章节
+    const names = ['encoder.int8.onnx', 'decoder.int8.onnx', 'tokens.txt', 'silero_vad.onnx', 'paraformer-encoder-front.rknn', 'paraformer-encoder-tail.onnx', 'cif.onnx'];
     for (const name of names) {
       const raw = `${RAWFILE_MODEL_DIR}/${name}`;
       const dst = `${modelDir}/${name}`;

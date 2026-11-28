@@ -100,10 +100,45 @@ class NpuBackend : public AsrBackend {
 
     // 3) RKNN 编码器 (ORT 模式下走 CPU 编码器, 跳过 RKNN 初始化)
     if (!use_ort_) {
-      if (LoadModel(config.modelDir + "/paraformer-encoder.rknn") !=
-          RKNN_SUCC) {
-        lastError_ = "failed to load paraformer-encoder.rknn from " +
-                     config.modelDir;
+      // 拼接路线 (NPU 浅层 + CPU 深层): 前段 .rknn (前 N 块, int8 保真度高)
+      // + 尾部 .onnx (块 N+1..49, ORT), 块 N 残差处 fp32 精确交接。绕开
+      // RK3588 深层残差流动态范围超 int8 表征的缺陷 (见 README NPU 章节)。
+      // 前段/尾部不齐全时回退全量 paraformer-encoder.rknn。
+      const std::string front_path =
+          config.modelDir + "/paraformer-encoder-front.rknn";
+      const std::string tail_path =
+          config.modelDir + "/paraformer-encoder-tail.onnx";
+      {
+        std::ifstream front_f(front_path);
+        std::ifstream tail_f(tail_path);
+        use_split_ = front_f.good() && tail_f.good();
+      }
+      if (use_split_) {
+        // 注意: 不使用 GetInputNameAllocated —— CLI 静态链接的 ORT 中该
+        // C API 为坏调用 (板端实测 SEGV_MAPERR), 与外置 CIF 路径相同改用
+        // 硬编码输入名 (尾部模型输入名由 tools/make_tail_model.py 固定为
+        // mid / speech_lengths)
+        try {
+          Ort::SessionOptions so;
+          so.SetIntraOpNumThreads(1);
+          tail_sess_ =
+              std::make_unique<Ort::Session>(cif_env_, tail_path.c_str(), so);
+        } catch (const std::exception& e) {
+          use_split_ = false;
+          lastError_ = std::string("failed to load tail model: ") + e.what();
+          fprintf(stderr, "npu: %s (fallback to full encoder)\n",
+                  lastError_.c_str());
+        } catch (...) {
+          use_split_ = false;
+          lastError_ = "failed to load tail model: unknown exception";
+          fprintf(stderr, "npu: %s (fallback to full encoder)\n",
+                  lastError_.c_str());
+        }
+      }
+      const std::string rknn_path =
+          use_split_ ? front_path : config.modelDir + "/paraformer-encoder.rknn";
+      if (LoadModel(rknn_path) != RKNN_SUCC) {
+        lastError_ = "failed to load " + rknn_path;
         return false;
       }
       // NPU 核掩码: 默认 core0; SSUB_NPU_CORE 覆盖 (0=auto 1/2/4 单核 7=全核)
@@ -193,6 +228,17 @@ class NpuBackend : public AsrBackend {
           cif_sess_ = std::make_shared<Ort::Session>(cif_env_, cif_path.c_str(), so);
           use_external_cif_ = true;
         }
+      }
+
+      // 拼接路线下前段 RKNN 只有 1 个输出 (无 alphas), 必须用外置 CIF
+      if (use_split_ && !use_external_cif_) {
+        lastError_ = "split route (front+tail) requires cif.onnx in " +
+                     config.modelDir;
+        return false;
+      }
+      if (getenv("SSUB_NPU_DEBUG")) {
+        fprintf(stderr, "npu: mode=%s\n",
+                use_split_ ? "split(front+tail)" : "full");
       }
     }
 
@@ -505,7 +551,8 @@ class NpuBackend : public AsrBackend {
       }
 
       // 请求 enc(0); 未启用外置 CIF 时再取 alphas(最后); 跳过 int64 的 enc_len
-      const bool rknn_alpha = !use_external_cif_;
+      // (拼接路线前段只有 1 个输出, alphas 一律来自外置 CIF)
+      const bool rknn_alpha = !use_external_cif_ && !use_split_;
       const uint32_t n_outs = rknn_alpha ? 2u : 1u;
       rknn_output outs[2];
       memset(outs, 0, sizeof(outs));
@@ -528,12 +575,36 @@ class NpuBackend : public AsrBackend {
       const float* p_alpha = rknn_alpha
           ? reinterpret_cast<const float*>(outs[1].buf)  // [1, num_frames]
           : nullptr;
-
-      // 拷贝 enc 数据后立即释放 RKNN 输出缓冲, 避免悬垂引用
-      enc_copy.assign(p_enc, p_enc + num_frames * 512);
       if (p_alpha != nullptr) {
         alpha.assign(p_alpha, p_alpha + num_frames);
       }
+
+      if (use_split_) {
+        // fp32 交接: NPU 前段输出 (块 N 残差) + speech_lengths → ORT 尾部
+        // (块 N+1..49 + after_norm + 末端长度相关步骤); 尾部输出即最终
+        // hidden states (与全模型 'enc' 同张量), 后续外置 CIF / 解码器不变
+        auto mem =
+            Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
+        std::array<int64_t, 3> mid_shape{1, num_frames, 512};
+        Ort::Value mid_v = Ort::Value::CreateTensor(
+            mem, const_cast<float*>(p_enc), num_frames * 512,
+            mid_shape.data(), 3);
+        int32_t tail_len = num_frames;
+        std::array<int64_t, 1> len_shape{1};
+        Ort::Value len_v =
+            Ort::Value::CreateTensor(mem, &tail_len, 1, len_shape.data(), 1);
+        // 输入名与 tools/make_tail_model.py 的固定命名一致
+        const char* tail_in_names[2] = {"mid", "speech_lengths"};
+        Ort::Value tail_inputs[2] = {std::move(mid_v), std::move(len_v)};
+        const char* tail_out_names[] = {"enc"};
+        auto tail_out = tail_sess_->Run(Ort::RunOptions{}, tail_in_names,
+                                        tail_inputs, 2, tail_out_names, 1);
+        const float* p_tail = tail_out[0].GetTensorData<float>();
+        enc_copy.assign(p_tail, p_tail + num_frames * 512);
+      } else {
+        enc_copy.assign(p_enc, p_enc + num_frames * 512);
+      }
+      // 拷贝完成后立即释放 RKNN 输出缓冲, 避免悬垂引用
       rknn_outputs_release(ctx_, n_outs, outs);
 
       if (use_external_cif_) {
@@ -867,6 +938,11 @@ class NpuBackend : public AsrBackend {
   Ort::Env cif_env_{ORT_LOGGING_LEVEL_WARNING, "ssub-cif"};
   std::shared_ptr<Ort::Session> cif_sess_;
   bool use_external_cif_ = false;
+
+  // NPU 拼接路线: 前段 RKNN (前 N 块) + 尾部 ORT (N+1..49), 块 N 残差处
+  // fp32 交接 (见 README NPU 章节)
+  std::unique_ptr<Ort::Session> tail_sess_;
+  bool use_split_ = false;
 
   int32_t num_processed_ = 0;
   std::vector<float> feat_cache_;
